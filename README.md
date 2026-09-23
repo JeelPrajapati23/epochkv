@@ -5,8 +5,8 @@ A distributed key-value store (Redis-like) built from scratch in C++, with a Pyt
 ## Features
 
 - [x] Project setup (CMake, Catch2 test harness, minimal blocking TCP server)
-- [ ] Core single-node store (RESP protocol parser, hash table, command dispatcher)
-- [ ] Concurrency (epoll-based event loop)
+- [x] Core single-node store (RESP protocol parser, hash table, command dispatcher)
+- [x] Concurrency (epoll-based event loop)
 - [ ] TTL & LRU eviction
 - [ ] Persistence (AOF + snapshotting)
 - [ ] Replication (master-replica)
@@ -14,3 +14,25 @@ A distributed key-value store (Redis-like) built from scratch in C++, with a Pyt
 - [ ] Fault tolerance (simplified leader election) — stretch goal
 - [ ] Python client + benchmark harness (+ optional vector-search extension)
 - [ ] Benchmarks and documentation
+
+Supported commands: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS`.
+
+## Build and run
+
+Requires Linux (epoll), CMake 3.20+, and a C++17 compiler.
+
+```sh
+cmake -S . -B build
+cmake --build build -j
+./build/src/kv_server                  # listens on 127.0.0.1:6380
+./build/src/kv_server --bind 0.0.0.0 --port 7000
+```
+
+Any Redis client works, e.g. `redis-cli -p 6380`.
+
+## Tests
+
+```sh
+(cd build && ctest)                        # unit tests (Catch2)
+python3 tests/integration/test_server.py   # end-to-end tests against the real binary
+```

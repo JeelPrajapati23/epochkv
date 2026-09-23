@@ -10,5 +10,8 @@ target_include_directories(reply PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_library(command_dispatcher command_dispatcher.cpp)
 target_link_libraries(command_dispatcher PUBLIC hash_table PRIVATE reply)
 
+add_library(server server.cpp)
+target_link_libraries(server PUBLIC resp_parser command_dispatcher PRIVATE reply)
+
 add_executable(kv_server kv_server.cpp)
-target_link_libraries(kv_server PRIVATE resp_parser command_dispatcher reply)
+target_link_libraries(kv_server PRIVATE server)
