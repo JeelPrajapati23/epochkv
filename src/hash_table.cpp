@@ -47,6 +47,16 @@ std::optional<std::string> HashTable::get(const std::string& key) const {
     return std::nullopt;
 }
 
+bool HashTable::contains(const std::string& key) const {
+    const auto& bucket = bucket_for(key);
+    for (const auto& entry : bucket) {
+        if (entry.key == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool HashTable::del(const std::string& key) {
     auto& bucket = bucket_for(key);
     for (auto it = bucket.begin(); it != bucket.end(); ++it) {

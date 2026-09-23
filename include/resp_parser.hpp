@@ -27,6 +27,11 @@ public:
     // On kIncomplete, the buffer must be left exactly as it was.
     ParseResult try_parse_command();
 
+    // Bytes fed but not yet consumed by a complete command. The server caps
+    // this so a client can't grow memory without bound by never finishing
+    // a command (e.g. declaring a huge bulk length and trickling bytes).
+    size_t buffered_bytes() const { return buffer_.size(); }
+
 private:
     std::string buffer_;
 

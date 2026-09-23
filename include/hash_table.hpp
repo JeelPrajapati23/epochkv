@@ -11,6 +11,7 @@ public:
 
     void set(const std::string& key, const std::string& value);
     std::optional<std::string> get(const std::string& key) const;
+    bool contains(const std::string& key) const;
     bool del(const std::string& key);
     size_t size() const;
 
