@@ -1,0 +1,35 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+_deps/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Python
+python-client/__pycache__/
+python-client/*.pyc
+python-client/.venv/
+python-client/venv/
+
+# Logs / local artifacts
+*.log
+*.aof
+*.rdb
+
+CLAUDE.md
