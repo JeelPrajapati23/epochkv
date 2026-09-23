@@ -108,12 +108,47 @@ bool Server::start() {
     return true;
 }
 
+void Server::set_cron(std::chrono::milliseconds interval, std::function<void()> task) {
+    cron_interval_ = interval;
+    cron_task_ = std::move(task);
+    next_cron_ = std::chrono::steady_clock::now() + interval;
+}
+
+// How long epoll_wait may sleep: until the next cron tick, or forever if
+// there's no cron. This is how timers live inside an event loop without a
+// separate thread — the wait itself is the timer.
+int Server::cron_timeout_ms() const {
+    if (!cron_task_) {
+        return -1;
+    }
+    auto remaining = next_cron_ - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) {
+        return 0;
+    }
+    // Round up, so we don't wake a fraction of a millisecond early and spin.
+    return static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(remaining).count());
+}
+
+void Server::run_cron_if_due() {
+    if (!cron_task_) {
+        return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (now < next_cron_) {
+        return;
+    }
+    cron_task_();
+    // Schedule from now rather than next_cron_ + interval: if a tick ran
+    // late, don't fire a burst of catch-up ticks back to back.
+    next_cron_ = now + cron_interval_;
+}
+
 void Server::run() {
     std::vector<epoll_event> events(kMaxEventsPerWait);
     bool running = true;
 
     while (running) {
-        int n = epoll_wait(epoll_fd_, events.data(), kMaxEventsPerWait, -1);
+        int n = epoll_wait(epoll_fd_, events.data(), kMaxEventsPerWait, cron_timeout_ms());
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -159,6 +194,9 @@ void Server::run() {
         // a stale event still queued for the old client would be applied to
         // the new one.
         close_pending();
+        // Checked after every wakeup, not only on timeout: under constant
+        // client traffic epoll_wait may never time out at all.
+        run_cron_if_due();
     }
 
     close_all();
@@ -288,7 +326,7 @@ void Server::set_write_interest(Connection& conn, bool enabled) {
         return;
     }
     epoll_event ev{};
-    ev.events = EPOLLIN | (enabled ? EPOLLOUT : 0);
+    ev.events = EPOLLIN | (enabled ? static_cast<uint32_t>(EPOLLOUT) : 0u);
     ev.data.fd = conn.fd;
     if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, conn.fd, &ev) < 0) {
         std::perror("epoll_ctl");

@@ -86,9 +86,16 @@ class Client:
 
 class ServerTest(unittest.TestCase):
     def setUp(self):
+        self.clients = []
+        self.proc = None
+        self.start_server()
+
+    def start_server(self, *extra_args):
+        """(Re)starts the server with extra command-line flags."""
+        self.stop_server()
         self.port = free_port()
         self.proc = subprocess.Popen(
-            [SERVER_BIN, "--port", str(self.port)],
+            [SERVER_BIN, "--port", str(self.port), *extra_args],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.time() + 5
         while True:
@@ -99,14 +106,17 @@ class ServerTest(unittest.TestCase):
                 if time.time() > deadline:
                     raise
                 time.sleep(0.02)
-        self.clients = []
 
-    def tearDown(self):
+    def stop_server(self):
         for c in self.clients:
             c.close()
-        if self.proc.poll() is None:
+        self.clients = []
+        if self.proc is not None and self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
+
+    def tearDown(self):
+        self.stop_server()
 
     def client(self):
         c = Client(self.port)
@@ -177,6 +187,42 @@ class ServerTest(unittest.TestCase):
         self.assertIn("Protocol error", str(reply))
         self.assertTrue(c.is_closed())
         self.assertEqual(self.client().cmd("PING"), "PONG")
+
+    def test_ttl_expires_keys_lazily_and_actively(self):
+        c = self.client()
+        self.assertEqual(c.cmd("SET", "lazy", "v", "PX", "100"), "OK")
+        for i in range(50):
+            self.assertEqual(c.cmd("SET", "active%d" % i, "v", "PX", "100"), "OK")
+        self.assertEqual(c.cmd("SET", "keep", "v"), "OK")
+        self.assertEqual(c.cmd("DBSIZE"), 52)
+        time.sleep(0.5)  # several 100ms cron ticks
+        # The active sweep reclaimed the keys nobody touched...
+        self.assertLessEqual(c.cmd("DBSIZE"), 2)
+        # ...and any survivor is still invisible once its deadline has passed.
+        self.assertIsNone(c.cmd("GET", "lazy"))
+        self.assertEqual(c.cmd("DBSIZE"), 1)
+        self.assertEqual(c.cmd("GET", "keep"), b"v")
+
+    def test_allkeys_lru_eviction_under_maxmemory(self):
+        self.start_server("--maxmemory", "100kb", "--maxmemory-policy", "allkeys-lru")
+        c = self.client()
+        value = b"x" * 1024
+        for i in range(500):  # ~500KB of values into a 100KB budget
+            self.assertEqual(c.cmd("SET", "k%d" % i, value), "OK")
+            if i >= 10:
+                c.cmd("GET", "k0")  # keep k0 hot
+        self.assertLess(c.cmd("DBSIZE"), 100)
+        self.assertEqual(c.cmd("GET", "k0"), value)
+        self.assertIsNone(c.cmd("GET", "k1"))
+        self.assertEqual(c.cmd("GET", "k499"), value)
+
+    def test_noeviction_rejects_writes_with_oom(self):
+        self.start_server("--maxmemory", "10kb")
+        c = self.client()
+        replies = [c.cmd("SET", "k%d" % i, b"x" * 1024) for i in range(20)]
+        self.assertIsInstance(replies[-1], RuntimeError)
+        self.assertIn("OOM", str(replies[-1]))
+        self.assertEqual(c.cmd("GET", "k0"), b"x" * 1024)
 
     def test_sigterm_shuts_down_cleanly(self):
         self.client()

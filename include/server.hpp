@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -27,6 +29,10 @@ public:
     // false (after logging the failing syscall) if any setup step fails.
     bool start();
 
+    // Runs `task` roughly every `interval` on the event-loop thread (Redis's
+    // serverCron). Call before run().
+    void set_cron(std::chrono::milliseconds interval, std::function<void()> task);
+
     // Runs the event loop until SIGINT/SIGTERM arrives.
     void run();
 
@@ -41,6 +47,9 @@ private:
         bool close_after_flush = false;   // protocol error: send the error, then close
         bool closing = false;             // queued for close at end of this loop iteration
     };
+
+    int cron_timeout_ms() const;
+    void run_cron_if_due();
 
     void accept_clients();
     void handle_readable(Connection& conn);
@@ -57,6 +66,12 @@ private:
     int listen_fd_ = -1;
     int epoll_fd_ = -1;
     int signal_fd_ = -1;
+
+    // steady_clock, not the wall clock: an NTP adjustment or manual clock
+    // change must not make the timer fire in a burst or stall for hours.
+    std::chrono::milliseconds cron_interval_{0};
+    std::function<void()> cron_task_;
+    std::chrono::steady_clock::time_point next_cron_;
 
     std::unordered_map<int, std::unique_ptr<Connection>> conns_;
     std::vector<int> pending_close_;
