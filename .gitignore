@@ -33,3 +33,4 @@ python-client/venv/
 *.rdb
 
 CLAUDE.md
+DESIGN.md
