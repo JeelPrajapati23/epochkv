@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <string>
+#include <vector>
 
 #include "store.hpp"
 
@@ -219,4 +220,81 @@ TEST_CASE("maxmemory 0 means unlimited", "[store][lru]") {
     }
     REQUIRE(store.evict_if_needed());
     REQUIRE(store.size() == 1000);
+}
+
+TEST_CASE("passive expiry hides expired keys without deleting them", "[store][ttl][replica]") {
+    FakeClock clock;
+    Store store = make_store(clock);
+    std::vector<std::string> deleted;
+    store.set_deletion_listener([&](const std::string& key) { deleted.push_back(key); });
+    store.set_passive_expiry(true);
+
+    store.set("k", "v");
+    store.set_expire("k", clock.now + 10);
+    clock.now += 10;
+    REQUIRE(store.get("k") == nullptr);
+    REQUIRE_FALSE(store.exists("k"));
+    REQUIRE(store.pttl("k") == -2);
+    REQUIRE_FALSE(store.persist("k"));
+    REQUIRE(store.active_expire_cycle(std::chrono::milliseconds(10)) == 0);
+    REQUIRE(store.size() == 1);  // still physically there
+    REQUIRE(deleted.empty());    // and nothing was reported as deleted
+}
+
+TEST_CASE("passive expiry: a past deadline doesn't delete; DEL still reclaims", "[store][ttl][replica]") {
+    FakeClock clock;
+    Store store = make_store(clock);
+    store.set_passive_expiry(true);
+
+    store.set("k", "v");
+    REQUIRE(store.set_expire("k", clock.now - 1));
+    REQUIRE(store.size() == 1);
+    REQUIRE(store.get("k") == nullptr);
+    REQUIRE_FALSE(store.del("k"));  // wasn't live...
+    REQUIRE(store.size() == 0);     // ...but is gone now
+    REQUIRE(store.used_memory() == 0);
+}
+
+TEST_CASE("passive expiry: SET over an expired key starts fresh, without the old TTL", "[store][ttl][replica]") {
+    FakeClock clock;
+    Store store = make_store(clock);
+    store.set_passive_expiry(true);
+
+    store.set("k", "old");
+    store.set_expire("k", clock.now + 10);
+    clock.now += 10;
+    store.set("k", "new", /*keep_ttl=*/true);
+    REQUIRE(*store.get("k") == "new");
+    REQUIRE(store.pttl("k") == -1);
+    REQUIRE(store.size() == 1);
+}
+
+TEST_CASE("turning passive expiry off lets expired keys be reclaimed again", "[store][ttl][replica]") {
+    FakeClock clock;
+    Store store = make_store(clock);
+    store.set_passive_expiry(true);
+    store.set("k", "v");
+    store.set_expire("k", clock.now + 10);
+    clock.now += 10;
+    REQUIRE(store.get("k") == nullptr);
+    REQUIRE(store.size() == 1);
+
+    store.set_passive_expiry(false);
+    REQUIRE(store.get("k") == nullptr);
+    REQUIRE(store.size() == 0);
+}
+
+TEST_CASE("clear drops every key and resets memory accounting", "[store]") {
+    FakeClock clock;
+    Store store = make_store(clock);
+    store.set("a", "1");
+    store.set("b", "2");
+    store.set_expire("b", clock.now + 100);
+    store.clear();
+    REQUIRE(store.size() == 0);
+    REQUIRE(store.used_memory() == 0);
+    REQUIRE(store.get("a") == nullptr);
+    store.set("a", "again");
+    REQUIRE(*store.get("a") == "again");
+    REQUIRE(store.pttl("a") == -1);
 }

@@ -25,7 +25,9 @@ public:
     // On kComplete, the consumed bytes are removed from the buffer so the
     // next call can parse whatever command follows (pipelining).
     // On kIncomplete, the buffer must be left exactly as it was.
-    ParseResult try_parse_command();
+    // If `raw` is given, a complete command's exact bytes are stored there
+    // too (a replica forwards its master's stream byte for byte).
+    ParseResult try_parse_command(std::string* raw = nullptr);
 
     // Bytes fed but not yet consumed by a complete command. The server caps
     // this so a client can't grow memory without bound by never finishing

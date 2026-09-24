@@ -3,8 +3,11 @@
 #include <cctype>
 #include <charconv>
 #include <optional>
+#include <utility>
 
+#include "client.hpp"
 #include "persistence.hpp"
+#include "replication.hpp"
 #include "reply.hpp"
 
 namespace {
@@ -13,6 +16,8 @@ constexpr const char* kErrNotInteger = "ERR value is not an integer or out of ra
 constexpr const char* kErrSyntax = "ERR syntax error";
 constexpr const char* kErrOom = "OOM command not allowed when used memory > 'maxmemory'.";
 constexpr const char* kErrNoPersistence = "ERR persistence is not enabled on this server";
+constexpr const char* kErrNoReplication = "ERR replication is not available here";
+constexpr const char* kErrReadOnly = "READONLY You can't write against a read only replica.";
 
 std::string to_upper(const std::string& s) {
     std::string upper(s);
@@ -79,6 +84,12 @@ CommandDispatcher::CommandDispatcher(Store& store)
           {"BGSAVE", {"bgsave", &CommandDispatcher::cmd_bgsave, 1, 0}},
           {"BGREWRITEAOF", {"bgrewriteaof", &CommandDispatcher::cmd_bgrewriteaof, 1, 0}},
           {"LASTSAVE", {"lastsave", &CommandDispatcher::cmd_lastsave, 1, 0}},
+          {"REPLICAOF", {"replicaof", &CommandDispatcher::cmd_replicaof, 3, 0}},
+          {"SLAVEOF", {"slaveof", &CommandDispatcher::cmd_replicaof, 3, 0}},
+          {"REPLCONF", {"replconf", &CommandDispatcher::cmd_replconf, -3, 0}},
+          {"PSYNC", {"psync", &CommandDispatcher::cmd_psync, 3, 0}},
+          {"WAIT", {"wait", &CommandDispatcher::cmd_wait, 3, 0}},
+          {"INFO", {"info", &CommandDispatcher::cmd_info, -1, 0}},
       } {}
 
 bool CommandDispatcher::loading() const {
@@ -98,7 +109,7 @@ bool CommandDispatcher::arity_ok(int arity, size_t argc) {
     return argc >= static_cast<size_t>(-arity);
 }
 
-void CommandDispatcher::dispatch(const Args& argv, std::string& out) {
+void CommandDispatcher::dispatch(const Args& argv, std::string& out, Client* client) {
     if (argv.empty()) {
         return;
     }
@@ -115,10 +126,19 @@ void CommandDispatcher::dispatch(const Args& argv, std::string& out) {
         return;
     }
 
+    // Our master's stream is obeyed unconditionally, past every check below:
+    // it already applied these writes, and refusing one would leave us
+    // diverged from it for good.
+    bool from_master = client != nullptr && client->is_master;
+    if ((spec.flags & kWrite) && !from_master && replication_ != nullptr && replication_->is_replica()) {
+        reply::error(out, kErrReadOnly);
+        return;
+    }
+
     // Both checks are skipped while replaying the AOF at startup: those
     // writes were already accepted once, and refusing them now would load a
     // different dataset than the one that was acknowledged.
-    if ((spec.flags & kWrite) && persistence_ != nullptr && !loading()) {
+    if ((spec.flags & kWrite) && persistence_ != nullptr && !loading() && !from_master) {
         std::string err = persistence_->write_error();
         if (!err.empty()) {
             reply::error(out, err);
@@ -129,12 +149,15 @@ void CommandDispatcher::dispatch(const Args& argv, std::string& out) {
     // Evict *before* the write rather than after: the command then runs
     // against a store that's within budget, and may overshoot by at most one
     // value until the next write evicts again — Redis's semantics.
-    if ((spec.flags & kDenyOom) && !loading() && !store_.evict_if_needed()) {
+    // A replica never evicts on its own: the master's evictions arrive as DELs.
+    if ((spec.flags & kDenyOom) && !loading() && !from_master && !store_.evict_if_needed()) {
         reply::error(out, kErrOom);
         return;
     }
 
+    Client* previous = std::exchange(client_, client);
     (this->*spec.handler)(argv, out);
+    client_ = previous;
 }
 
 // PING [message]
@@ -374,4 +397,120 @@ void CommandDispatcher::cmd_lastsave(const Args&, std::string& out) {
         return;
     }
     reply::integer(out, persistence_->lastsave());
+}
+
+// REPLICAOF host port — become a replica of that server, discarding our
+// dataset for its. REPLICAOF NO ONE — stop replicating and become a master,
+// keeping the data. (SLAVEOF is the old name.)
+void CommandDispatcher::cmd_replicaof(const Args& argv, std::string& out) {
+    if (replication_ == nullptr) {
+        reply::error(out, kErrNoReplication);
+        return;
+    }
+    if (to_upper(argv[1]) == "NO" && to_upper(argv[2]) == "ONE") {
+        replication_->replicaof_no_one();
+        reply::simple_string(out, "OK");
+        return;
+    }
+    int64_t port;
+    if (!parse_int64(argv[2], port) || port <= 0 || port > 65535) {
+        reply::error(out, "ERR Invalid master port");
+        return;
+    }
+    replication_->replicaof(argv[1], static_cast<uint16_t>(port));
+    reply::simple_string(out, "OK");
+}
+
+// REPLCONF option value [option value ...] — replica/master handshake:
+//   listening-port <port>  the port the replica serves on (for INFO)
+//   capa <capability>      what the replica supports; psync2 is implied
+//   ack <offset>           replica -> master: stream bytes applied so far
+//   getack *               master -> replica: send an ack now
+// ack and getack are never answered: they travel on replication links,
+// where a reply would be read as stream data.
+void CommandDispatcher::cmd_replconf(const Args& argv, std::string& out) {
+    if (argv.size() % 2 == 0) {
+        reply::error(out, kErrSyntax);
+        return;
+    }
+    for (size_t i = 1; i < argv.size(); i += 2) {
+        std::string opt = to_upper(argv[i]);
+        if (opt == "LISTENING-PORT") {
+            int64_t port;
+            if (!parse_int64(argv[i + 1], port) || port <= 0 || port > 65535) {
+                reply::error(out, "ERR Invalid listening port");
+                return;
+            }
+            if (client_ != nullptr) {
+                client_->repl_listening_port = static_cast<uint16_t>(port);
+            }
+        } else if (opt == "CAPA") {
+            continue;
+        } else if (opt == "ACK") {
+            int64_t offset;
+            if (replication_ != nullptr && client_ != nullptr && parse_int64(argv[i + 1], offset) && offset >= 0) {
+                replication_->replconf_ack(*client_, static_cast<uint64_t>(offset));
+            }
+            return;
+        } else if (opt == "GETACK") {
+            if (replication_ != nullptr && client_ != nullptr && client_->is_master) {
+                replication_->replconf_getack();
+            }
+            return;
+        } else {
+            reply::error(out, "ERR Unrecognized REPLCONF option: " + sanitize_for_error(argv[i]));
+            return;
+        }
+    }
+    reply::simple_string(out, "OK");
+}
+
+// PSYNC replid offset — a replica asking to continue history `replid` from
+// byte `offset`; "PSYNC ? -1" asks for a full resync. Replies +CONTINUE or
+// +FULLRESYNC, after which this connection carries the replication stream.
+void CommandDispatcher::cmd_psync(const Args& argv, std::string& out) {
+    if (replication_ == nullptr || client_ == nullptr) {
+        reply::error(out, kErrNoReplication);
+        return;
+    }
+    int64_t offset;
+    if (!parse_int64(argv[2], offset)) {
+        reply::error(out, kErrNotInteger);
+        return;
+    }
+    replication_->psync(*client_, argv[1], offset, out);
+}
+
+// WAIT numreplicas timeout-ms — blocks until this client's writes so far
+// have been acknowledged by at least numreplicas replicas, or the timeout
+// passes (0 = wait forever). Replies with how many acknowledged.
+void CommandDispatcher::cmd_wait(const Args& argv, std::string& out) {
+    if (replication_ == nullptr || client_ == nullptr) {
+        reply::error(out, kErrNoReplication);
+        return;
+    }
+    int64_t numreplicas;
+    int64_t timeout;
+    if (!parse_int64(argv[1], numreplicas) || !parse_int64(argv[2], timeout)) {
+        reply::error(out, kErrNotInteger);
+        return;
+    }
+    if (timeout < 0) {
+        reply::error(out, "ERR timeout is negative");
+        return;
+    }
+    replication_->wait(*client_, numreplicas, timeout, out);
+}
+
+// INFO [section ...] — server status as "field:value" lines. Only the
+// replication section exists so far.
+void CommandDispatcher::cmd_info(const Args& argv, std::string& out) {
+    bool replication_wanted = argv.size() == 1;
+    for (size_t i = 1; i < argv.size(); ++i) {
+        std::string section = to_upper(argv[i]);
+        if (section == "REPLICATION" || section == "ALL" || section == "DEFAULT" || section == "EVERYTHING") {
+            replication_wanted = true;
+        }
+    }
+    reply::bulk_string(out, replication_wanted && replication_ != nullptr ? replication_->info() : "");
 }

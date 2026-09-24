@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // RESP2 reply encoders. Each function appends one encoded reply to `out`
 // (the connection's output buffer) instead of returning a fresh string, so
@@ -24,5 +25,9 @@ void bulk_string(std::string& out, std::string_view s);
 
 // $-1\r\n — "no such key".
 void null_bulk(std::string& out);
+
+// *<n>\r\n followed by n bulk strings: a command as clients send it. Also
+// the wire format of the AOF and of the replication stream.
+void command(std::string& out, const std::vector<std::string>& argv);
 
 }  // namespace reply

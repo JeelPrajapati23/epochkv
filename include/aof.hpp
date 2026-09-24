@@ -53,6 +53,12 @@ public:
     // Starts a fresh AOF whose base is the current contents of `store`.
     bool create(const Store& store, std::string& error);
 
+    // Replaces an open AOF with a fresh one based on `store`, discarding
+    // everything logged so far — for when the whole dataset was replaced
+    // (a replica's full resync). The manifest rename is the commit point: a
+    // crash before it keeps the old AOF, after it the new one.
+    bool reset(const Store& store, std::string& error);
+
     // Buffers one command. Nothing reaches the file until flush().
     void feed(const Args& argv);
 

@@ -17,6 +17,7 @@
 #include <thread>
 
 #include "file_util.hpp"
+#include "reply.hpp"
 #include "resp_parser.hpp"
 #include "snapshot.hpp"
 
@@ -34,20 +35,6 @@ std::string base_name(uint64_t seq) {
 
 std::string incr_name(uint64_t seq) {
     return "appendonly.aof." + std::to_string(seq) + ".incr.aof";
-}
-
-// Same RESP array encoding clients send, so loading reuses the network parser.
-void append_command(std::string& out, const std::vector<std::string>& argv) {
-    out += '*';
-    out += std::to_string(argv.size());
-    out += "\r\n";
-    for (const std::string& arg : argv) {
-        out += '$';
-        out += std::to_string(arg.size());
-        out += "\r\n";
-        out += arg;
-        out += "\r\n";
-    }
 }
 
 uint64_t file_size(const std::string& path) {
@@ -259,6 +246,34 @@ bool AppendOnlyFile::create(const Store& store, std::string& error) {
     return true;
 }
 
+bool AppendOnlyFile::reset(const Store& store, std::string& error) {
+    if (fsync_worker_) {
+        fsync_worker_->wait_idle();  // it may be using fd_, which we close below
+    }
+    std::optional<FileEntry> old_base = base_;
+    std::vector<FileEntry> old_incrs = incrs_;
+    int old_fd = fd_;
+    if (!create(store, error)) {
+        base_ = old_base;
+        incrs_ = old_incrs;
+        return false;
+    }
+    buf_.clear();  // unflushed writes to the dataset that was just replaced
+    write_errno_ = 0;
+    unsynced_ = false;
+    if (old_fd >= 0) {
+        close(old_fd);
+    }
+    if (old_base) {
+        unlink(path(old_base->name).c_str());
+    }
+    for (const FileEntry& f : old_incrs) {
+        unlink(path(f.name).c_str());
+    }
+    fileutil::fsync_dir(dir_);
+    return true;
+}
+
 bool AppendOnlyFile::load(Store& store, const Replay& replay, std::string& error) {
     if (!read_manifest(error)) {
         return false;
@@ -360,7 +375,8 @@ bool AppendOnlyFile::replay_incr(const std::string& file, bool is_last, const Re
 }
 
 void AppendOnlyFile::feed(const Args& argv) {
-    append_command(buf_, argv);
+    // Same RESP array encoding clients send, so loading reuses the network parser.
+    reply::command(buf_, argv);
 }
 
 bool AppendOnlyFile::flush() {

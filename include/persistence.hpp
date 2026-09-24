@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -78,6 +79,17 @@ public:
     int64_t lastsave() const { return last_save_unix_; }
     bool child_running() const { return child_pid_ >= 0; }
 
+    // Told when a background snapshot (BGSAVE) finishes, successfully or
+    // not. Replication uses it: a full resync ships that snapshot.
+    void set_snapshot_listener(std::function<void(bool ok)> listener) { snapshot_listener_ = std::move(listener); }
+    std::string snapshot_path() const;
+    const std::string& dir() const { return options_.dir; }
+
+    // Replaces the whole dataset with the snapshot at `snapshot_file` (a
+    // replica's full resync): stops any child, clears the store, loads the
+    // file, installs it as the snapshot, and restarts the AOF from it.
+    bool replace_dataset(const std::string& snapshot_file, std::string& error);
+
     // Non-empty while writes must be refused because they can't be
     // persisted (a failed background save, or a failing AOF). Acknowledging
     // writes that will be lost on restart would be worse than refusing them.
@@ -95,11 +107,11 @@ private:
     std::string child_temp_path(ChildKind kind, pid_t pid) const;
     bool save_point_reached(SteadyTime now) const;
     bool aof_needs_rewrite(SteadyTime now) const;
-    std::string snapshot_path() const;
 
     Store& store_;
     Options options_;
     std::unique_ptr<AppendOnlyFile> aof_;
+    std::function<void(bool)> snapshot_listener_;
     bool loading_ = false;
     bool aof_was_healthy_ = true;
 

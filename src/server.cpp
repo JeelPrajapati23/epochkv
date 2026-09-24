@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "reply.hpp"
+#include "replication.hpp"
 
 namespace {
 
@@ -27,7 +28,10 @@ constexpr size_t kMaxQueryBufferBytes = 64 * 1024 * 1024;
 // Upper bound on replies queued for a client that isn't reading them
 // (Redis: client-output-buffer-limit). Without it, a client that pipelines
 // GETs of large values and never reads can grow server memory unboundedly.
+// (Replicas get a larger limit, enforced by Replication.)
 constexpr size_t kMaxOutputBufferBytes = 64 * 1024 * 1024;
+// A full-resync snapshot is streamed to the replica in chunks this big.
+constexpr size_t kSnapshotChunkSize = 64 * 1024;
 
 }  // namespace
 
@@ -174,12 +178,19 @@ void Server::run() {
                 running = false;
                 continue;
             }
+            if (auto w = watchers_.find(fd); w != watchers_.end()) {
+                // Call a copy: the callback may unwatch or re-watch its own
+                // fd, destroying the stored std::function mid-call.
+                std::function<void()> on_ready = w->second;
+                on_ready();
+                continue;
+            }
 
             auto it = conns_.find(fd);
             if (it == conns_.end() || it->second->closing) {
                 continue;
             }
-            Connection& conn = *it->second;
+            Client& conn = *it->second;
 
             // EPOLLERR/EPOLLHUP are routed through the read path on purpose:
             // read() then returns 0 (peer closed) or -1 with the real errno
@@ -217,7 +228,9 @@ void Server::accept_clients() {
     // Level-triggered, but drain the backlog anyway: one wakeup per accepted
     // client would waste a syscall round-trip per connection under a burst.
     while (true) {
-        int fd = accept4(listen_fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        sockaddr_in peer{};
+        socklen_t peer_len = sizeof(peer);
+        int fd = accept4(listen_fd_, reinterpret_cast<sockaddr*>(&peer), &peer_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if (errno == EINTR || errno == ECONNABORTED) {
                 continue;
@@ -244,11 +257,54 @@ void Server::accept_clients() {
             close(fd);
             continue;
         }
-        conns_.emplace(fd, std::make_unique<Connection>(fd));
+        Client& c = add_client(fd);
+        char ip[INET_ADDRSTRLEN] = "?";
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+        c.addr = ip;
     }
 }
 
-void Server::handle_readable(Connection& conn) {
+Client& Server::add_client(int fd) {
+    auto client = std::make_unique<Client>(next_client_id_++, fd);
+    Client& c = *client;
+    conns_[fd] = std::move(client);
+    return c;
+}
+
+Client& Server::adopt_master(int fd, const std::string& pending) {
+    Client& c = add_client(fd);
+    c.is_master = true;
+    c.parser.feed(pending.data(), pending.size());
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = fd;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        std::perror("epoll_ctl");
+        mark_closing(c);  // replication reconnects when it's reaped
+    }
+    return c;
+}
+
+bool Server::watch(int fd, bool want_write, std::function<void()> on_ready) {
+    epoll_event ev{};
+    ev.events = want_write ? EPOLLOUT : EPOLLIN;
+    ev.data.fd = fd;
+    int op = watchers_.count(fd) != 0 ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+    if (epoll_ctl(epoll_fd_, op, fd, &ev) < 0) {
+        std::perror("epoll_ctl");
+        return false;
+    }
+    watchers_[fd] = std::move(on_ready);
+    return true;
+}
+
+void Server::unwatch(int fd) {
+    if (watchers_.erase(fd) != 0) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+    }
+}
+
+void Server::handle_readable(Client& conn) {
     // One read per wakeup, not read-until-EAGAIN: with level-triggered epoll
     // any leftover bytes re-trigger next iteration, and a single client
     // blasting data can't starve everyone else in this batch.
@@ -268,21 +324,55 @@ void Server::handle_readable(Connection& conn) {
     if (conn.close_after_flush) {
         return;  // already hit a protocol error; ignore further input
     }
-
+    conn.last_interaction = std::chrono::steady_clock::now();
     conn.parser.feed(buf, static_cast<size_t>(n));
+    process_input(conn);
+}
 
-    while (true) {
-        RespParser::ParseResult result = conn.parser.try_parse_command();
+void Server::process_buffered(Client& conn) {
+    if (!conn.closing) {
+        process_input(conn);
+    }
+}
+
+void Server::process_input(Client& conn) {
+    std::string raw;
+    std::string discarded;
+    // A client parked by WAIT keeps buffering input but runs nothing until
+    // it's unblocked, so its replies stay in order.
+    while (!conn.blocked && !conn.close_after_flush && !conn.closing) {
+        RespParser::ParseResult result = conn.parser.try_parse_command(conn.is_master ? &raw : nullptr);
         if (result.status == RespParser::Status::kIncomplete) {
             break;
         }
         if (result.status == RespParser::Status::kProtocolError) {
+            if (conn.is_master) {
+                std::cerr << "protocol error in the master's stream; dropping the link\n";
+                mark_closing(conn);
+                return;
+            }
             // Framing is broken: we can't tell where the next command starts.
             reply::error(conn.out, "ERR Protocol error");
             conn.close_after_flush = true;
             break;
         }
-        dispatcher_.dispatch(result.command, conn.out);
+        if (conn.is_master) {
+            // Applied without a reply, then counted toward our offset.
+            dispatcher_.dispatch(result.command, discarded, &conn);
+            replication_->master_command_applied(raw);
+        } else if (conn.repl_state != Client::ReplState::kNone) {
+            // Once a connection carries the replication stream, a reply
+            // would be read as stream data by the replica. (Only REPLCONF
+            // ACK should arrive here anyway.)
+            dispatcher_.dispatch(result.command, discarded, &conn);
+        } else {
+            uint64_t before = replication_ != nullptr ? replication_->offset() : 0;
+            dispatcher_.dispatch(result.command, conn.out, &conn);
+            if (replication_ != nullptr && replication_->offset() != before) {
+                conn.woff = replication_->offset();  // it wrote: WAIT counts from here
+            }
+        }
+        discarded.clear();
     }
 
     if (!conn.close_after_flush && conn.parser.buffered_bytes() > kMaxQueryBufferBytes) {
@@ -293,7 +383,7 @@ void Server::handle_readable(Connection& conn) {
     queue_write(conn);
 }
 
-void Server::queue_write(Connection& conn) {
+void Server::queue_write(Client& conn) {
     if (!conn.pending_write) {
         conn.pending_write = true;
         pending_writes_.push_back(conn.fd);
@@ -307,7 +397,7 @@ void Server::flush_pending_writes() {
         if (it == conns_.end()) {
             continue;
         }
-        Connection& conn = *it->second;
+        Client& conn = *it->second;
         conn.pending_write = false;
         if (!conn.closing) {
             flush(conn);
@@ -316,7 +406,10 @@ void Server::flush_pending_writes() {
     pending_writes_.clear();
 }
 
-void Server::flush(Connection& conn) {
+void Server::flush(Client& conn) {
+    if (conn.repl_snapshot_fd >= 0 && !refill_snapshot(conn)) {
+        return;
+    }
     // Write optimistically right away: the socket send buffer is almost
     // always free, so most replies go out without ever touching EPOLLOUT.
     size_t sent = 0;
@@ -336,7 +429,10 @@ void Server::flush(Connection& conn) {
     }
     conn.out.erase(0, sent);
 
-    if (conn.out.empty()) {
+    // Mid-snapshot, an empty buffer just means "read the next chunk": stay
+    // subscribed to EPOLLOUT so we come back for it.
+    bool sending_snapshot = conn.repl_state == Client::ReplState::kSendBulk;
+    if (conn.out.empty() && !sending_snapshot) {
         set_write_interest(conn, false);
         if (conn.close_after_flush) {
             mark_closing(conn);
@@ -344,7 +440,7 @@ void Server::flush(Connection& conn) {
         return;
     }
 
-    if (conn.out.size() > kMaxOutputBufferBytes) {
+    if (conn.repl_state == Client::ReplState::kNone && conn.out.size() > kMaxOutputBufferBytes) {
         std::cerr << "closing client fd " << conn.fd << ": output buffer limit exceeded\n";
         mark_closing(conn);
         return;
@@ -355,7 +451,33 @@ void Server::flush(Connection& conn) {
     set_write_interest(conn, true);
 }
 
-void Server::set_write_interest(Connection& conn, bool enabled) {
+// Streams a full-resync snapshot to a replica one chunk per loop iteration,
+// topping up only once the previous chunk has mostly gone out: the file is
+// never held in memory whole, and one big transfer can't monopolize the
+// loop. Returns false if the client was closed.
+bool Server::refill_snapshot(Client& conn) {
+    if (conn.out.size() >= kSnapshotChunkSize) {
+        return true;
+    }
+    char buf[kSnapshotChunkSize];
+    ssize_t n = read(conn.repl_snapshot_fd, buf, sizeof(buf));
+    if (n < 0) {
+        if (errno == EINTR) {
+            return true;
+        }
+        std::perror("reading the snapshot for a replica");
+        mark_closing(conn);
+        return false;
+    }
+    if (n == 0) {
+        replication_->snapshot_sent(conn);  // queues the writes held back meanwhile
+        return true;
+    }
+    conn.out.append(buf, static_cast<size_t>(n));
+    return true;
+}
+
+void Server::set_write_interest(Client& conn, bool enabled) {
     if (conn.write_interest == enabled) {
         return;
     }
@@ -370,7 +492,7 @@ void Server::set_write_interest(Connection& conn, bool enabled) {
     conn.write_interest = enabled;
 }
 
-void Server::mark_closing(Connection& conn) {
+void Server::mark_closing(Client& conn) {
     if (!conn.closing) {
         conn.closing = true;
         pending_close_.push_back(conn.fd);
@@ -379,21 +501,35 @@ void Server::mark_closing(Connection& conn) {
 
 void Server::close_pending() {
     for (int fd : pending_close_) {
+        auto it = conns_.find(fd);
+        if (it == conns_.end()) {
+            continue;
+        }
+        if (replication_ != nullptr) {
+            replication_->client_closed(*it->second);
+        }
         // close() alone also removes the fd from the epoll set, but only once
         // no other descriptor refers to the same socket — explicit DEL is
         // the unambiguous version.
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         close(fd);
-        conns_.erase(fd);
+        conns_.erase(it);
     }
     pending_close_.clear();
 }
 
 void Server::close_all() {
     for (auto& [fd, conn] : conns_) {
+        if (replication_ != nullptr) {
+            replication_->client_closed(*conn);
+        }
         close(fd);
     }
     conns_.clear();
+    for (auto& [fd, on_ready] : watchers_) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);  // the watcher's owner closes the fd
+    }
+    watchers_.clear();
     pending_writes_.clear();
     pending_close_.clear();
 }

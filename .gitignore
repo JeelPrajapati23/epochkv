@@ -22,7 +22,7 @@ _deps/
 Thumbs.db
 
 # Python
-python-client/__pycache__/
+__pycache__/
 python-client/*.pyc
 python-client/.venv/
 python-client/venv/

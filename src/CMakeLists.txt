@@ -25,11 +25,17 @@ target_link_libraries(aof PUBLIC store PRIVATE snapshot resp_parser file_util Th
 add_library(persistence persistence.cpp)
 target_link_libraries(persistence PUBLIC aof store PRIVATE snapshot file_util)
 
+add_library(repl_backlog repl_backlog.cpp)
+target_include_directories(repl_backlog PUBLIC ${PROJECT_SOURCE_DIR}/include)
+
+add_library(replication replication.cpp)
+target_link_libraries(replication PUBLIC repl_backlog resp_parser PRIVATE store persistence reply file_util)
+
 add_library(command_dispatcher command_dispatcher.cpp)
-target_link_libraries(command_dispatcher PUBLIC store PRIVATE persistence reply)
+target_link_libraries(command_dispatcher PUBLIC store resp_parser PRIVATE persistence replication reply)
 
 add_library(server server.cpp)
-target_link_libraries(server PUBLIC resp_parser command_dispatcher PRIVATE reply)
+target_link_libraries(server PUBLIC resp_parser command_dispatcher PRIVATE replication reply)
 
 add_executable(kv_server kv_server.cpp)
-target_link_libraries(kv_server PRIVATE server persistence)
+target_link_libraries(kv_server PRIVATE server persistence replication)

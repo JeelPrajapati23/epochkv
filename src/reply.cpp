@@ -32,4 +32,13 @@ void null_bulk(std::string& out) {
     out += "$-1\r\n";
 }
 
+void command(std::string& out, const std::vector<std::string>& argv) {
+    out += '*';
+    out += std::to_string(argv.size());
+    out += "\r\n";
+    for (const std::string& arg : argv) {
+        bulk_string(out, arg);
+    }
+}
+
 }  // namespace reply

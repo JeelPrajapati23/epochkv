@@ -10,6 +10,7 @@
 
 #include "command_dispatcher.hpp"
 #include "persistence.hpp"
+#include "replication.hpp"
 #include "server.hpp"
 #include "store.hpp"
 
@@ -32,7 +33,8 @@ void usage(const char* prog) {
                  " [--maxmemory-policy noeviction|allkeys-lru]\n"
                  "       [--dir DIR] [--dbfilename NAME] [--save \"SECONDS CHANGES ...\"]\n"
                  "       [--appendonly yes|no] [--appendfsync always|everysec|no]\n"
-                 "       [--auto-aof-rewrite-percentage PCT] [--auto-aof-rewrite-min-size BYTES]\n";
+                 "       [--auto-aof-rewrite-percentage PCT] [--auto-aof-rewrite-min-size BYTES]\n"
+                 "       [--replicaof HOST PORT] [--repl-backlog-size BYTES] [--repl-timeout SECONDS]\n";
 }
 
 // "3600 1 300 100" -> {{3600, 1}, {300, 100}}; "" -> no save points.
@@ -98,6 +100,8 @@ int main(int argc, char** argv) {
     uint16_t port = kDefaultPort;
     Store::Options store_options;
     Persistence::Options persistence_options;
+    Replication::Options repl_options;
+    std::optional<std::pair<std::string, uint16_t>> replicaof;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -178,6 +182,30 @@ int main(int argc, char** argv) {
                 return 1;
             }
             persistence_options.auto_aof_rewrite_min_size = *bytes;
+        } else if (arg == "--replicaof" && i + 2 < argc) {
+            std::string host = argv[++i];
+            char* end = nullptr;
+            long value = std::strtol(argv[++i], &end, 10);
+            if (*end != '\0' || value <= 0 || value > 65535) {
+                std::cerr << "invalid replicaof port: " << argv[i] << "\n";
+                return 1;
+            }
+            replicaof.emplace(host, static_cast<uint16_t>(value));
+        } else if (arg == "--repl-backlog-size" && has_value) {
+            std::optional<size_t> bytes = parse_memory(argv[++i]);
+            if (!bytes || *bytes == 0) {
+                std::cerr << "invalid repl-backlog-size: " << argv[i] << "\n";
+                return 1;
+            }
+            repl_options.backlog_size = *bytes;
+        } else if (arg == "--repl-timeout" && has_value) {
+            char* end = nullptr;
+            long value = std::strtol(argv[++i], &end, 10);
+            if (*end != '\0' || value <= 0) {
+                std::cerr << "invalid repl-timeout: " << argv[i] << "\n";
+                return 1;
+            }
+            repl_options.timeout = std::chrono::seconds(value);
         } else {
             usage(argv[0]);
             return 1;
@@ -186,12 +214,26 @@ int main(int argc, char** argv) {
 
     Store store(store_options);
     Persistence persistence(store, persistence_options);
+    repl_options.listening_port = port;
+    Replication replication(store, persistence, repl_options);
     CommandDispatcher dispatcher(store);
     dispatcher.set_persistence(&persistence);
-    dispatcher.set_propagator([&persistence](const CommandDispatcher::Args& argv) { persistence.propagate(argv); });
+    dispatcher.set_replication(&replication);
+
+    // Every change to the dataset goes to both the AOF and the replicas, in
+    // the same deterministic form. Not while loading from disk: that data
+    // is already in the AOF, and it isn't part of the replication stream.
+    auto propagate = [&persistence, &replication](const CommandDispatcher::Args& argv) {
+        if (!persistence.loading()) {
+            persistence.propagate(argv);
+            replication.propagate(argv);
+        }
+    };
+    dispatcher.set_propagator(propagate);
     // Keys the store drops on its own are logged as DEL, so replaying the
-    // AOF can't resurrect them (e.g. an evicted key that had no TTL).
-    store.set_deletion_listener([&persistence](const std::string& key) { persistence.propagate({"DEL", key}); });
+    // AOF can't resurrect them (e.g. an evicted key that had no TTL), and so
+    // replicas — which never expire or evict keys themselves — drop them too.
+    store.set_deletion_listener([propagate](const std::string& key) { propagate({"DEL", key}); });
 
     std::string error;
     bool loaded = persistence.load(
@@ -207,14 +249,25 @@ int main(int argc, char** argv) {
     std::cout << "loaded " << store.size() << " keys from disk\n";
 
     Server server(bind_addr, port, dispatcher);
-    server.set_cron(kCronInterval, [&store, &persistence] {
-        store.active_expire_cycle(kActiveExpireBudget);
+    server.set_replication(&replication);
+    replication.attach(&server);
+    server.set_cron(kCronInterval, [&store, &persistence, &replication] {
+        store.active_expire_cycle(kActiveExpireBudget);  // a no-op on a replica
         persistence.cron();
+        replication.cron();
     });
-    server.set_before_sleep([&persistence] { persistence.before_sleep(); });
+    // Replication first: clients it unblocks may run writes, which the AOF
+    // flush right after must include before their replies go out.
+    server.set_before_sleep([&persistence, &replication] {
+        replication.before_sleep();
+        persistence.before_sleep();
+    });
 
     if (!server.start()) {
         return 1;
+    }
+    if (replicaof) {
+        replication.replicaof(replicaof->first, replicaof->second);
     }
     server.run();
     return persistence.shutdown() ? 0 : 1;

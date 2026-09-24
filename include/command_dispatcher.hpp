@@ -8,6 +8,8 @@
 #include "store.hpp"
 
 class Persistence;
+class Replication;
+struct Client;
 
 // Routes a parsed command (argv[0] is the command name) to its handler and
 // appends the RESP-encoded reply to an output buffer. Knows nothing about
@@ -26,10 +28,17 @@ public:
     // Enables SAVE/BGSAVE/BGREWRITEAOF/LASTSAVE, and refusing writes while
     // they can't be persisted. Optional: without it those commands error.
     void set_persistence(Persistence* persistence) { persistence_ = persistence; }
+    // Enables REPLICAOF/PSYNC/REPLCONF/WAIT/INFO, and refusing writes from
+    // clients while this server is a replica.
+    void set_replication(Replication* replication) { replication_ = replication; }
 
-    // Executes `argv` and appends exactly one reply to `out`. An empty argv
-    // produces no reply (Redis silently ignores an empty array, *0\r\n).
-    void dispatch(const Args& argv, std::string& out);
+    // Executes `argv` and appends exactly one reply to `out`, with three
+    // exceptions that append nothing: an empty argv (Redis silently ignores
+    // *0\r\n), REPLCONF ACK/GETACK (replication traffic, never answered),
+    // and a WAIT that parks the client (it's answered later).
+    // `client` is the connection that sent the command; nullptr for internal
+    // callers (AOF replay, tests), where the replication commands error.
+    void dispatch(const Args& argv, std::string& out, Client* client = nullptr);
 
 private:
     using Handler = void (CommandDispatcher::*)(const Args&, std::string&);
@@ -72,6 +81,11 @@ private:
     void cmd_bgsave(const Args& argv, std::string& out);
     void cmd_bgrewriteaof(const Args& argv, std::string& out);
     void cmd_lastsave(const Args& argv, std::string& out);
+    void cmd_replicaof(const Args& argv, std::string& out);
+    void cmd_replconf(const Args& argv, std::string& out);
+    void cmd_psync(const Args& argv, std::string& out);
+    void cmd_wait(const Args& argv, std::string& out);
+    void cmd_info(const Args& argv, std::string& out);
 
     // relative: the argument is a TTL (EXPIRE) rather than a timestamp (EXPIREAT).
     void expire_generic(const Args& argv, int64_t unit_ms, bool relative, const char* name, std::string& out);
@@ -79,6 +93,8 @@ private:
     Store& store_;
     Propagator propagator_;
     Persistence* persistence_ = nullptr;
+    Replication* replication_ = nullptr;
+    Client* client_ = nullptr;  // sender of the command being dispatched
     // Keyed by uppercase command name; built once, looked up per command.
     std::unordered_map<std::string, CommandSpec> table_;
 };

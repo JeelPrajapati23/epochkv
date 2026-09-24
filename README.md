@@ -9,13 +9,13 @@ A distributed key-value store (Redis-like) built from scratch in C++, with a Pyt
 - [x] Concurrency (epoll-based event loop)
 - [x] TTL & LRU eviction
 - [x] Persistence (AOF + snapshotting)
-- [ ] Replication (master-replica)
+- [x] Replication (master-replica)
 - [ ] Sharding (consistent hashing)
 - [ ] Fault tolerance (simplified leader election) — stretch goal
 - [ ] Python client + benchmark harness (+ optional vector-search extension)
 - [ ] Benchmarks and documentation
 
-Supported commands: `PING`, `ECHO`, `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`), `GET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `DBSIZE`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE`.
+Supported commands: `PING`, `ECHO`, `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`), `GET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `DBSIZE`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE`, `REPLICAOF`, `WAIT`, `INFO`.
 
 ## Build and run
 
@@ -41,9 +41,29 @@ Two mechanisms, as in Redis, both off the hot path:
 
 On startup the AOF is loaded if enabled, otherwise the snapshot. A command torn by a crash at the end of the AOF is truncated away; any other corruption stops the server from starting. If a background save or AOF write fails, writes are refused with `-MISCONF` until persistence recovers.
 
+## Replication
+
+Asynchronous master-replica replication using Redis's PSYNC protocol:
+
+```sh
+./build/src/kv_server --port 6380                                  # master
+./build/src/kv_server --port 6381 --replicaof 127.0.0.1 6380       # replica
+```
+
+Or at runtime: `REPLICAOF host port`, and `REPLICAOF NO ONE` to promote a replica to master.
+
+- **Full resync:** the master forks a snapshot, streams it to the replica, then sends the writes that happened meanwhile. The replica swaps in the new dataset, keeps the snapshot as its own, and restarts its AOF from it.
+- **Streaming:** every write is sent to replicas as a deterministic command (the same form the AOF logs). Replicas are read-only (`-READONLY`), never expire or evict keys on their own (the master's `DEL`s drive that), and acknowledge their offset every second.
+- **Partial resync:** the master keeps the recent stream in a circular backlog (`--repl-backlog-size`, default 1mb). A replica that reconnects after a short outage asks to continue from its offset and gets only the bytes it missed.
+- **Failover:** a promoted replica keeps its old replication ID as a secondary one, so the other replicas of the old master can continue from it with a partial resync instead of a full copy.
+- **Chaining:** a replica can have replicas of its own, which get the master's stream byte for byte.
+- **`WAIT numreplicas timeout`** blocks a client until its writes are acknowledged by that many replicas. This narrows the window for losing an acknowledged write if the master crashes, but doesn't make replication synchronous or strongly consistent.
+- `INFO replication` shows the role, link status, offsets, attached replicas and sync counters. Dead links are detected after `--repl-timeout` seconds (default 60).
+
 ## Tests
 
 ```sh
-(cd build && ctest)                        # unit tests (Catch2)
-python3 tests/integration/test_server.py   # end-to-end tests against the real binary
+(cd build && ctest)                             # unit tests (Catch2)
+python3 tests/integration/test_server.py        # end-to-end tests against the real binary
+python3 tests/integration/test_replication.py   # multi-process replication tests
 ```

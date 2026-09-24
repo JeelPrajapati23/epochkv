@@ -202,7 +202,8 @@ void Persistence::reap_child() {
 
 void Persistence::finish_child(bool ok) {
     std::string temp = child_temp_path(child_kind_, child_pid_);
-    if (child_kind_ == ChildKind::kSnapshot) {
+    bool snapshot_done = child_kind_ == ChildKind::kSnapshot;
+    if (snapshot_done) {
         // The child already fsynced the file; the rename is the commit point.
         if (ok && fileutil::durable_rename(temp, snapshot_path())) {
             // Writes made after the fork aren't in this snapshot: only the
@@ -215,6 +216,7 @@ void Persistence::finish_child(bool ok) {
         } else {
             unlink(temp.c_str());
             last_bgsave_ok_ = false;
+            ok = false;
             std::cerr << "background save failed\n";
         }
     } else {
@@ -228,6 +230,9 @@ void Persistence::finish_child(bool ok) {
     }
     child_pid_ = -1;
     child_kind_ = ChildKind::kNone;
+    if (snapshot_done && snapshot_listener_) {
+        snapshot_listener_(ok);
+    }
 }
 
 void Persistence::kill_child() {
@@ -241,6 +246,35 @@ void Persistence::kill_child() {
     while (waitpid(child_pid_, nullptr, 0) < 0 && errno == EINTR) {
     }
     finish_child(false);
+}
+
+bool Persistence::replace_dataset(const std::string& snapshot_file, std::string& error) {
+    kill_child();  // whatever it's writing describes the old dataset
+    loading_ = true;
+    store_.clear();
+    bool ok = snapshot::load(snapshot_file, store_, error) == snapshot::LoadResult::kOk;
+    loading_ = false;
+    if (!ok) {
+        unlink(snapshot_file.c_str());
+        return false;
+    }
+    // The received file is a valid snapshot of exactly this dataset: keep
+    // it as ours instead of writing the same bytes again.
+    if (fileutil::durable_rename(snapshot_file, snapshot_path())) {
+        dirty_ = 0;
+        last_save_ = std::chrono::steady_clock::now();
+        last_save_unix_ = unix_seconds();
+        last_bgsave_ok_ = true;
+    } else {
+        std::cerr << "can't install the received snapshot: " << std::strerror(errno) << "\n";
+        unlink(snapshot_file.c_str());
+    }
+    // An AOF left describing the old dataset would resurrect it on restart.
+    if (aof_ && !aof_->reset(store_, error)) {
+        error = "restarting the AOF: " + error;
+        return false;
+    }
+    return true;
 }
 
 bool Persistence::shutdown() {

@@ -3,8 +3,12 @@
 #include <string>
 #include <vector>
 
+#include "client.hpp"
 #include "command_dispatcher.hpp"
+#include "persistence.hpp"
+#include "replication.hpp"
 #include "store.hpp"
+#include "temp_dir.hpp"
 
 namespace {
 
@@ -322,4 +326,93 @@ TEST_CASE("persistence commands need a persistence layer", "[dispatcher]") {
     CommandDispatcher d(store);
     REQUIRE(run(d, {"BGSAVE"}) == "-ERR persistence is not enabled on this server\r\n");
     REQUIRE(run(d, {"LASTSAVE"}) == "-ERR persistence is not enabled on this server\r\n");
+}
+
+TEST_CASE("a replica refuses writes from clients but applies its master's", "[dispatcher][replication]") {
+    TempDir dir;
+    Store store;
+    Persistence::Options options;
+    options.dir = dir.path;
+    options.save_points.clear();
+    Persistence persistence(store, options);
+    Replication replication(store, persistence, Replication::Options{});
+    CommandDispatcher d(store);
+    d.set_replication(&replication);
+
+    REQUIRE(run(d, {"REPLICAOF", "127.0.0.1", "6390"}) == "+OK\r\n");
+    REQUIRE(replication.is_replica());
+
+    Client user(1, -1);
+    std::string out;
+    d.dispatch({"SET", "k", "v"}, out, &user);
+    REQUIRE(out == "-READONLY You can't write against a read only replica.\r\n");
+    out.clear();
+    d.dispatch({"GET", "k"}, out, &user);
+    REQUIRE(out == "$-1\r\n");
+
+    Client master(2, -1);
+    master.is_master = true;
+    out.clear();
+    d.dispatch({"SET", "k", "v"}, out, &master);
+    REQUIRE(out == "+OK\r\n");
+    REQUIRE(*store.get("k") == "v");
+
+    REQUIRE(run(d, {"REPLICAOF", "no", "one"}) == "+OK\r\n");
+    out.clear();
+    d.dispatch({"SET", "k", "v2"}, out, &user);
+    REQUIRE(out == "+OK\r\n");
+}
+
+TEST_CASE("INFO reports the replication role", "[dispatcher][replication]") {
+    TempDir dir;
+    Store store;
+    Persistence::Options options;
+    options.dir = dir.path;
+    Persistence persistence(store, options);
+    Replication replication(store, persistence, Replication::Options{});
+    CommandDispatcher d(store);
+    d.set_replication(&replication);
+
+    REQUIRE(run(d, {"INFO"}).find("role:master\r\n") != std::string::npos);
+    REQUIRE(run(d, {"INFO", "replication"}).find("master_replid:" + replication.replid()) != std::string::npos);
+    REQUIRE(run(d, {"INFO", "keyspace"}) == "$0\r\n\r\n");
+    run(d, {"REPLICAOF", "localhost", "7000"});
+    std::string info = run(d, {"INFO"});
+    REQUIRE(info.find("role:slave\r\n") != std::string::npos);
+    REQUIRE(info.find("master_link_status:down\r\n") != std::string::npos);
+}
+
+TEST_CASE("replication commands validate arguments and context", "[dispatcher][replication]") {
+    Store store;
+    CommandDispatcher bare(store);
+    REQUIRE(run(bare, {"REPLICAOF", "h", "1"}) == "-ERR replication is not available here\r\n");
+
+    TempDir dir;
+    Persistence::Options options;
+    options.dir = dir.path;
+    Persistence persistence(store, options);
+    Replication replication(store, persistence, Replication::Options{});
+    CommandDispatcher d(store);
+    d.set_replication(&replication);
+
+    REQUIRE(run(d, {"REPLICAOF", "h", "0"}) == "-ERR Invalid master port\r\n");
+    REQUIRE(run(d, {"PSYNC", "?", "-1"}) == "-ERR replication is not available here\r\n");  // no client
+    REQUIRE(run(d, {"REPLCONF", "capa", "psync2", "ack"}) == "-ERR syntax error\r\n");
+    REQUIRE(run(d, {"REPLCONF", "capa", "psync2"}) == "+OK\r\n");
+    REQUIRE(run(d, {"REPLCONF", "bogus", "x"}) == "-ERR Unrecognized REPLCONF option: bogus\r\n");
+    REQUIRE(run(d, {"REPLCONF", "ACK", "10"}).empty());  // never answered
+
+    Client c(1, -1);
+    std::string out;
+    d.dispatch({"REPLCONF", "listening-port", "6400"}, out, &c);
+    REQUIRE(out == "+OK\r\n");
+    REQUIRE(c.repl_listening_port == 6400);
+
+    out.clear();
+    d.dispatch({"WAIT", "0", "-1"}, out, &c);
+    REQUIRE(out == "-ERR timeout is negative\r\n");
+    out.clear();
+    d.dispatch({"WAIT", "0", "100"}, out, &c);  // zero replicas needed: satisfied at once
+    REQUIRE(out == ":0\r\n");
+    REQUIRE_FALSE(c.blocked);
 }

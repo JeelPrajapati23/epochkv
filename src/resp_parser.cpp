@@ -36,7 +36,7 @@ void RespParser::feed(const char* data, size_t len) {
     buffer_.append(data, len);
 }
 
-RespParser::ParseResult RespParser::try_parse_command() {
+RespParser::ParseResult RespParser::try_parse_command(std::string* raw) {
     if (buffer_.empty()) {
         return {Status::kIncomplete, {}};
     }
@@ -90,6 +90,9 @@ RespParser::ParseResult RespParser::try_parse_command() {
         pos += str_len + 2;
     }
 
+    if (raw != nullptr) {
+        raw->assign(buffer_, 0, pos);
+    }
     buffer_.erase(0, pos);
     return {Status::kComplete, std::move(command)};
 }

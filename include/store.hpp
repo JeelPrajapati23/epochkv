@@ -75,6 +75,18 @@ public:
 
     void set_deletion_listener(DeletionListener listener) { deletion_listener_ = std::move(listener); }
 
+    // Passive expiry (on for replicas): expired keys read as missing but are
+    // never deleted here — not on access, not by active_expire_cycle(), not
+    // by set_expire() with a past time. The master decides when a key is
+    // gone and sends a DEL; deleting on the replica's own clock would let
+    // the two diverge whenever their clocks disagree.
+    void set_passive_expiry(bool on) { passive_expiry_ = on; }
+    bool passive_expiry() const { return passive_expiry_; }
+
+    // Drops every key (a replica about to load its master's snapshot).
+    // Doesn't notify the deletion listener.
+    void clear();
+
     // Calls fn(key, value, expire_ms) for every key; expire_ms is -1 if the
     // key has no TTL. Includes expired keys not yet reclaimed. Read-only, so
     // it's safe in a forked child walking its copy-on-write view of the store.
@@ -98,9 +110,11 @@ private:
         std::list<std::string>::iterator lru_pos;
     };
 
-    // Lazily expires `key`, then returns its entry (nullptr if absent).
+    // Lazily expires `key`, then returns its entry (nullptr if absent or
+    // expired).
     // touch = move to the front of the LRU list.
     Entry* lookup(const std::string& key, bool touch);
+    // True if `key` has expired; also deletes it unless expiry is passive.
     bool expire_if_needed(const std::string& key);
     // Deletes the key from every structure. `key` must not refer to storage
     // inside the store itself (e.g. an lru_ node) — pass a copy.
@@ -114,6 +128,7 @@ private:
     HashTable<int64_t> expires_;
     std::list<std::string> lru_;
     std::mt19937_64 rng_;
+    bool passive_expiry_ = false;
 
     size_t used_memory_ = 0;
     size_t expired_keys_ = 0;

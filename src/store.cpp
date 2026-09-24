@@ -45,6 +45,9 @@ bool Store::expire_if_needed(const std::string& key) {
     if (when == nullptr || *when > now_ms()) {
         return false;
     }
+    if (passive_expiry_) {
+        return true;
+    }
     std::string victim = key;  // copy: `key` may alias storage remove() frees
     remove(victim);
     ++expired_keys_;
@@ -53,7 +56,9 @@ bool Store::expire_if_needed(const std::string& key) {
 }
 
 Store::Entry* Store::lookup(const std::string& key, bool touch) {
-    expire_if_needed(key);
+    if (expire_if_needed(key)) {
+        return nullptr;
+    }
     Entry* entry = dict_.find(key);
     if (entry != nullptr && touch) {
         // splice relinks the existing node: O(1), no allocation, and every
@@ -83,20 +88,27 @@ void Store::set(const std::string& key, std::string value, bool keep_ttl) {
         }
         return;
     }
+    if (passive_expiry_) {
+        remove(key);  // an expired key may still be physically here
+    }
     used_memory_ += entry_cost(key, value.size());
     lru_.push_front(key);
     dict_.set(key, Entry{std::move(value), lru_.begin()});
 }
 
+// Returns whether the key was live, but always removes it: under passive
+// expiry, a DEL for an already-expired key must still reclaim it.
 bool Store::del(const std::string& key) {
-    return lookup(key, false) != nullptr && remove(key);
+    bool live = lookup(key, false) != nullptr;
+    remove(key);
+    return live;
 }
 
 bool Store::set_expire(const std::string& key, int64_t when_ms) {
     if (lookup(key, true) == nullptr) {
         return false;
     }
-    if (when_ms <= now_ms()) {
+    if (when_ms <= now_ms() && !passive_expiry_) {
         remove(key);
         return true;
     }
@@ -142,6 +154,9 @@ bool Store::evict_if_needed() {
 }
 
 size_t Store::active_expire_cycle(std::chrono::microseconds budget) {
+    if (passive_expiry_) {
+        return 0;
+    }
     auto deadline = std::chrono::steady_clock::now() + budget;
     size_t total_expired = 0;
 
@@ -171,6 +186,13 @@ size_t Store::active_expire_cycle(std::chrono::microseconds budget) {
 
     expired_keys_ += total_expired;
     return total_expired;
+}
+
+void Store::clear() {
+    dict_ = HashTable<Entry>();
+    expires_ = HashTable<int64_t>();
+    lru_.clear();
+    used_memory_ = 0;
 }
 
 bool Store::remove(const std::string& key) {
