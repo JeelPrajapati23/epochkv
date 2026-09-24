@@ -100,6 +100,17 @@ public:
         }
     }
 
+    // Calls fn(key, value) for every entry, in bucket order. fn must not
+    // modify the table.
+    template <typename F>
+    void for_each(F&& fn) const {
+        for (const auto& bucket : buckets_) {
+            for (const auto& entry : bucket) {
+                fn(entry.key, entry.value);
+            }
+        }
+    }
+
     size_t size() const { return num_entries_; }
     size_t bucket_count() const { return buckets_.size(); }
 

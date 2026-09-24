@@ -33,6 +33,12 @@ public:
     // serverCron). Call before run().
     void set_cron(std::chrono::milliseconds interval, std::function<void()> task);
 
+    // Runs `hook` once per loop iteration, after commands have executed but
+    // before any of their replies are written (Redis's beforeSleep). The
+    // AOF flush lives here: a reply must never leave before the write it
+    // acknowledges has been handed to the AOF.
+    void set_before_sleep(std::function<void()> hook);
+
     // Runs the event loop until SIGINT/SIGTERM arrives.
     void run();
 
@@ -44,6 +50,7 @@ private:
         RespParser parser;
         std::string out;                  // encoded replies not yet sent
         bool write_interest = false;      // currently registered for EPOLLOUT
+        bool pending_write = false;       // queued in pending_writes_
         bool close_after_flush = false;   // protocol error: send the error, then close
         bool closing = false;             // queued for close at end of this loop iteration
     };
@@ -53,6 +60,8 @@ private:
 
     void accept_clients();
     void handle_readable(Connection& conn);
+    void queue_write(Connection& conn);
+    void flush_pending_writes();
     void flush(Connection& conn);
     void set_write_interest(Connection& conn, bool enabled);
     void mark_closing(Connection& conn);
@@ -72,7 +81,9 @@ private:
     std::chrono::milliseconds cron_interval_{0};
     std::function<void()> cron_task_;
     std::chrono::steady_clock::time_point next_cron_;
+    std::function<void()> before_sleep_;
 
     std::unordered_map<int, std::unique_ptr<Connection>> conns_;
+    std::vector<int> pending_writes_;  // clients with fresh replies to send this iteration
     std::vector<int> pending_close_;
 };

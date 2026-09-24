@@ -45,8 +45,10 @@ bool Store::expire_if_needed(const std::string& key) {
     if (when == nullptr || *when > now_ms()) {
         return false;
     }
-    remove(key);
+    std::string victim = key;  // copy: `key` may alias storage remove() frees
+    remove(victim);
     ++expired_keys_;
+    notify_deleted(victim);
     return true;
 }
 
@@ -134,6 +136,7 @@ bool Store::evict_if_needed() {
         std::string victim = lru_.back();  // copy: remove() frees the node
         remove(victim);
         ++evicted_keys_;
+        notify_deleted(victim);
     }
     return true;
 }
@@ -153,6 +156,7 @@ size_t Store::active_expire_cycle(std::chrono::microseconds budget) {
                 std::string victim = *key;  // copy: remove() frees the entry
                 remove(victim);
                 ++expired;
+                notify_deleted(victim);
             }
         }
         total_expired += expired;
@@ -179,6 +183,12 @@ bool Store::remove(const std::string& key) {
     dict_.del(key);
     clear_expire(key);
     return true;
+}
+
+void Store::notify_deleted(const std::string& key) {
+    if (deletion_listener_) {
+        deletion_listener_(key);
+    }
 }
 
 bool Store::clear_expire(const std::string& key) {

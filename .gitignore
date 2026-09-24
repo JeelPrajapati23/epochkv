@@ -31,6 +31,8 @@ python-client/venv/
 *.log
 *.aof
 *.rdb
+*.snap
+appendonlydir/
 
 CLAUDE.md
 DESIGN.md

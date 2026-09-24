@@ -27,6 +27,10 @@ enum class EvictionPolicy {
 class Store {
 public:
     using Clock = std::function<int64_t()>;  // current unix time in ms
+    // Told about keys the store deletes on its own (expiry, eviction), as
+    // opposed to deletes a command asked for. Persistence logs these as DEL
+    // so a replay can't bring back a key that is already gone here.
+    using DeletionListener = std::function<void(const std::string& key)>;
 
     struct Options {
         size_t maxmemory = 0;  // bytes; 0 = unlimited
@@ -69,6 +73,19 @@ public:
     // and the time budget allows. Returns how many keys were deleted.
     size_t active_expire_cycle(std::chrono::microseconds budget);
 
+    void set_deletion_listener(DeletionListener listener) { deletion_listener_ = std::move(listener); }
+
+    // Calls fn(key, value, expire_ms) for every key; expire_ms is -1 if the
+    // key has no TTL. Includes expired keys not yet reclaimed. Read-only, so
+    // it's safe in a forked child walking its copy-on-write view of the store.
+    template <typename F>
+    void for_each(F&& fn) const {
+        dict_.for_each([&](const std::string& key, const Entry& entry) {
+            const int64_t* when = expires_.find(key);
+            fn(key, entry.value, when != nullptr ? *when : int64_t{-1});
+        });
+    }
+
     int64_t now_ms() const { return options_.clock(); }
     size_t size() const { return dict_.size(); }
     size_t used_memory() const { return used_memory_; }
@@ -89,8 +106,10 @@ private:
     // inside the store itself (e.g. an lru_ node) — pass a copy.
     bool remove(const std::string& key);
     bool clear_expire(const std::string& key);
+    void notify_deleted(const std::string& key);
 
     Options options_;
+    DeletionListener deletion_listener_;
     HashTable<Entry> dict_;
     HashTable<int64_t> expires_;
     std::list<std::string> lru_;

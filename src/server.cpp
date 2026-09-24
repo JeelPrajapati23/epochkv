@@ -114,6 +114,10 @@ void Server::set_cron(std::chrono::milliseconds interval, std::function<void()> 
     next_cron_ = std::chrono::steady_clock::now() + interval;
 }
 
+void Server::set_before_sleep(std::function<void()> hook) {
+    before_sleep_ = std::move(hook);
+}
+
 // How long epoll_wait may sleep: until the next cron tick, or forever if
 // there's no cron. This is how timers live inside an event loop without a
 // separate thread — the wait itself is the timer.
@@ -189,14 +193,21 @@ void Server::run() {
             }
         }
 
+        // Checked after every wakeup, not only on timeout: under constant
+        // client traffic epoll_wait may never time out at all.
+        run_cron_if_due();
+        // Persist first, reply second. Deferring replies to here also
+        // batches: every write from this iteration, across all clients,
+        // shares one AOF write (and one fsync under appendfsync always).
+        if (before_sleep_) {
+            before_sleep_();
+        }
+        flush_pending_writes();
         // Closes are deferred to here: if we close()d mid-batch, a later
         // accept() in the same batch could be handed the same fd number, and
         // a stale event still queued for the old client would be applied to
         // the new one.
         close_pending();
-        // Checked after every wakeup, not only on timeout: under constant
-        // client traffic epoll_wait may never time out at all.
-        run_cron_if_due();
     }
 
     close_all();
@@ -279,7 +290,30 @@ void Server::handle_readable(Connection& conn) {
         conn.close_after_flush = true;
     }
 
-    flush(conn);
+    queue_write(conn);
+}
+
+void Server::queue_write(Connection& conn) {
+    if (!conn.pending_write) {
+        conn.pending_write = true;
+        pending_writes_.push_back(conn.fd);
+    }
+}
+
+void Server::flush_pending_writes() {
+    // fds here can't have been reused: closes only happen after this.
+    for (int fd : pending_writes_) {
+        auto it = conns_.find(fd);
+        if (it == conns_.end()) {
+            continue;
+        }
+        Connection& conn = *it->second;
+        conn.pending_write = false;
+        if (!conn.closing) {
+            flush(conn);
+        }
+    }
+    pending_writes_.clear();
 }
 
 void Server::flush(Connection& conn) {
@@ -360,5 +394,6 @@ void Server::close_all() {
         close(fd);
     }
     conns_.clear();
+    pending_writes_.clear();
     pending_close_.clear();
 }

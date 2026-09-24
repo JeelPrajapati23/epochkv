@@ -4,11 +4,14 @@ Usage: python3 tests/integration/test_server.py [path/to/kv_server]
 (defaults to build/src/kv_server relative to the repo root)
 """
 
+import glob
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -88,6 +91,9 @@ class ServerTest(unittest.TestCase):
     def setUp(self):
         self.clients = []
         self.proc = None
+        # Each test gets its own data directory, kept across restarts within
+        # the test, so snapshots and AOFs never leak between tests.
+        self.dir = tempfile.mkdtemp(prefix="kv_store_it_")
         self.start_server()
 
     def start_server(self, *extra_args):
@@ -95,7 +101,7 @@ class ServerTest(unittest.TestCase):
         self.stop_server()
         self.port = free_port()
         self.proc = subprocess.Popen(
-            [SERVER_BIN, "--port", str(self.port), *extra_args],
+            [SERVER_BIN, "--port", str(self.port), "--dir", self.dir, *extra_args],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.time() + 5
         while True:
@@ -115,8 +121,24 @@ class ServerTest(unittest.TestCase):
             self.proc.kill()
             self.proc.wait()
 
+    def shutdown_server(self):
+        """Graceful stop (SIGTERM), which runs the shutdown persistence path."""
+        for c in self.clients:
+            c.close()
+        self.clients = []
+        self.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(self.proc.wait(timeout=10), 0)
+
     def tearDown(self):
         self.stop_server()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def wait_until(self, predicate, timeout=10):
+        deadline = time.time() + timeout
+        while not predicate():
+            if time.time() > deadline:
+                self.fail("condition not reached within %ss" % timeout)
+            time.sleep(0.02)
 
     def client(self):
         c = Client(self.port)
@@ -228,6 +250,115 @@ class ServerTest(unittest.TestCase):
         self.client()
         self.proc.send_signal(signal.SIGTERM)
         self.assertEqual(self.proc.wait(timeout=5), 0)
+
+    # --- persistence -------------------------------------------------------
+
+    def aof_dir(self):
+        return os.path.join(self.dir, "appendonlydir")
+
+    def test_snapshot_on_shutdown_survives_restart(self):
+        c = self.client()
+        self.assertEqual(c.cmd("SET", "k", "v"), "OK")
+        self.assertEqual(c.cmd("SET", "ttl", "v", "EX", "100"), "OK")
+        self.shutdown_server()  # default save points => final SAVE on shutdown
+        self.start_server()
+        c = self.client()
+        self.assertEqual(c.cmd("GET", "k"), b"v")
+        self.assertTrue(95 <= c.cmd("TTL", "ttl") <= 100)
+
+    def test_bgsave_survives_kill9(self):
+        self.start_server("--save", "")
+        c = self.client()
+        self.assertEqual(c.cmd("SET", "k", "v"), "OK")
+        self.assertEqual(c.cmd("BGSAVE"), "Background saving started")
+        dump = os.path.join(self.dir, "dump.snap")
+        self.wait_until(lambda: os.path.exists(dump))
+        self.assertEqual(c.cmd("SET", "unsaved", "v"), "OK")
+        self.stop_server()  # SIGKILL: no shutdown save
+        self.start_server("--save", "")
+        c = self.client()
+        self.assertEqual(c.cmd("GET", "k"), b"v")
+        self.assertIsNone(c.cmd("GET", "unsaved"))
+
+    def test_aof_always_survives_kill9(self):
+        flags = ("--save", "", "--appendonly", "yes", "--appendfsync", "always")
+        self.start_server(*flags)
+        c = self.client()
+        self.assertEqual(c.cmd("SET", "a", "1"), "OK")
+        self.assertEqual(c.cmd("SET", "b", "2", "PX", "60000"), "OK")
+        self.assertEqual(c.cmd("DEL", "a"), 1)
+        self.assertEqual(c.cmd("SET", "c", "3"), "OK")
+        self.stop_server()  # SIGKILL right after the last OK
+        self.start_server(*flags)
+        c = self.client()
+        self.assertIsNone(c.cmd("GET", "a"))
+        self.assertEqual(c.cmd("GET", "b"), b"2")
+        self.assertTrue(0 < c.cmd("PTTL", "b") <= 60000)
+        self.assertEqual(c.cmd("GET", "c"), b"3")
+
+    def test_sigterm_with_everysec_aof_flushes_and_exits_cleanly(self):
+        # everysec starts a background fsync thread; SIGTERM must still reach
+        # the signalfd instead of killing the process via that thread.
+        flags = ("--save", "", "--appendonly", "yes", "--appendfsync", "everysec")
+        self.start_server(*flags)
+        self.assertEqual(self.client().cmd("SET", "k", "v"), "OK")
+        self.shutdown_server()
+        self.start_server(*flags)
+        self.assertEqual(self.client().cmd("GET", "k"), b"v")
+
+    def test_pipelined_writes_all_reach_the_aof(self):
+        flags = ("--save", "", "--appendonly", "yes", "--appendfsync", "always")
+        self.start_server(*flags)
+        c = self.client()
+        c.send(b"".join(encode("SET", "k%d" % i, "v%d" % i) for i in range(1000)))
+        self.assertEqual([c.read_reply() for _ in range(1000)], ["OK"] * 1000)
+        self.stop_server()
+        self.start_server(*flags)
+        self.assertEqual(self.client().cmd("DBSIZE"), 1000)
+
+    def test_bgrewriteaof_compacts_and_keeps_data(self):
+        flags = ("--save", "", "--appendonly", "yes")
+        self.start_server(*flags)
+        c = self.client()
+        for i in range(2000):
+            c.cmd("SET", "counter", str(i))
+        self.assertEqual(c.cmd("BGREWRITEAOF"), "Background append only file rewriting started")
+
+        def compacted():
+            incrs = glob.glob(os.path.join(self.aof_dir(), "*.incr.aof"))
+            bases = glob.glob(os.path.join(self.aof_dir(), "*.base.snap"))
+            return len(incrs) == 1 and len(bases) == 1 and os.path.getsize(incrs[0]) == 0
+
+        self.wait_until(compacted)
+        self.assertEqual(c.cmd("SET", "after", "rewrite"), "OK")
+        self.shutdown_server()
+        self.start_server(*flags)
+        c = self.client()
+        self.assertEqual(c.cmd("GET", "counter"), b"1999")
+        self.assertEqual(c.cmd("GET", "after"), b"rewrite")
+
+    def test_aof_with_torn_last_command_still_loads(self):
+        flags = ("--save", "", "--appendonly", "yes", "--appendfsync", "always")
+        self.start_server(*flags)
+        self.assertEqual(self.client().cmd("SET", "k", "v"), "OK")
+        self.stop_server()
+        (incr,) = glob.glob(os.path.join(self.aof_dir(), "*.incr.aof"))
+        with open(incr, "ab") as f:
+            f.write(b"*3\r\n$3\r\nSET\r\n$4\r\nhal")  # crash mid-write
+        self.start_server(*flags)
+        c = self.client()
+        self.assertEqual(c.cmd("GET", "k"), b"v")
+        self.assertEqual(c.cmd("DBSIZE"), 1)
+
+    def test_corrupt_snapshot_refuses_to_start(self):
+        self.shutdown_server()
+        with open(os.path.join(self.dir, "dump.snap"), "wb") as f:
+            f.write(b"definitely not a snapshot")
+        proc = subprocess.Popen([SERVER_BIN, "--port", str(free_port()), "--dir", self.dir],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _, err = proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"bad magic", err)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
+#include <vector>
 
 #include "command_dispatcher.hpp"
 #include "store.hpp"
@@ -219,4 +220,106 @@ TEST_CASE("writes over maxmemory with allkeys-lru evict the oldest keys", "[disp
     REQUIRE(cs.store.evicted_keys() > 0);
     REQUIRE(run(d, {"GET", "k0"}) == "$-1\r\n");
     REQUIRE(run(d, {"GET", "k49"}) == "$5\r\nvalue\r\n");
+}
+
+namespace {
+
+// Collects what the dispatcher propagates, one space-joined command per entry.
+struct PropagationLog {
+    std::vector<std::string> commands;
+
+    void attach(CommandDispatcher& d) {
+        d.set_propagator([this](const CommandDispatcher::Args& argv) {
+            std::string joined;
+            for (const std::string& arg : argv) {
+                joined += (joined.empty() ? "" : " ") + arg;
+            }
+            commands.push_back(joined);
+        });
+    }
+};
+
+}  // namespace
+
+TEST_CASE("SET is propagated with its TTL as an absolute PXAT, without NX/XX", "[dispatcher][propagation]") {
+    ClockedStore cs;
+    CommandDispatcher d(cs.store);
+    PropagationLog log;
+    log.attach(d);
+
+    run(d, {"SET", "a", "1"});
+    run(d, {"SET", "b", "2", "EX", "10"});
+    run(d, {"SET", "c", "3", "PX", "1500", "NX"});
+    run(d, {"SET", "c", "4", "NX"});  // condition failed: nothing changed, nothing logged
+    run(d, {"SET", "b", "5", "XX", "KEEPTTL"});
+    run(d, {"SET", "d", "6", "PXAT", "1005000"});
+
+    REQUIRE(log.commands == std::vector<std::string>{
+                                "SET a 1",
+                                "SET b 2 PXAT 1010000",
+                                "SET c 3 PXAT 1001500",
+                                "SET b 5 KEEPTTL",
+                                "SET d 6 PXAT 1005000",
+                            });
+}
+
+TEST_CASE("EXPIRE-family commands are propagated as PEXPIREAT, or DEL if they delete", "[dispatcher][propagation]") {
+    ClockedStore cs;
+    CommandDispatcher d(cs.store);
+    run(d, {"SET", "k", "v"});
+    run(d, {"SET", "j", "v"});
+    PropagationLog log;
+    log.attach(d);
+
+    REQUIRE(run(d, {"EXPIRE", "k", "10"}) == ":1\r\n");
+    REQUIRE(run(d, {"PEXPIRE", "k", "20"}) == ":1\r\n");
+    REQUIRE(run(d, {"EXPIREAT", "k", "2000"}) == ":1\r\n");
+    REQUIRE(run(d, {"PEXPIREAT", "k", "3000000"}) == ":1\r\n");
+    REQUIRE(run(d, {"EXPIRE", "missing", "10"}) == ":0\r\n");
+    REQUIRE(run(d, {"PERSIST", "k"}) == ":1\r\n");
+    REQUIRE(run(d, {"PERSIST", "k"}) == ":0\r\n");
+    REQUIRE(run(d, {"EXPIRE", "j", "0"}) == ":1\r\n");
+
+    REQUIRE(log.commands == std::vector<std::string>{
+                                "PEXPIREAT k 1010000",
+                                "PEXPIREAT k 1000020",
+                                "PEXPIREAT k 2000000",
+                                "PEXPIREAT k 3000000",
+                                "PERSIST k",
+                                "DEL j",
+                            });
+}
+
+TEST_CASE("DEL is propagated only if it removed something; reads never are", "[dispatcher][propagation]") {
+    Store store;
+    CommandDispatcher d(store);
+    run(d, {"SET", "k", "v"});
+    PropagationLog log;
+    log.attach(d);
+
+    run(d, {"GET", "k"});
+    run(d, {"EXISTS", "k"});
+    run(d, {"TTL", "k"});
+    run(d, {"DEL", "missing"});
+    run(d, {"DEL", "k", "missing"});
+    REQUIRE(log.commands == std::vector<std::string>{"DEL k missing"});
+}
+
+TEST_CASE("EXPIREAT and SET EXAT use absolute times", "[dispatcher][ttl]") {
+    ClockedStore cs;  // now = 1,000,000 ms = 1000 s
+    CommandDispatcher d(cs.store);
+    run(d, {"SET", "a", "v", "EXAT", "1010"});
+    REQUIRE(run(d, {"TTL", "a"}) == ":10\r\n");
+    run(d, {"SET", "b", "v"});
+    REQUIRE(run(d, {"PEXPIREAT", "b", "1002500"}) == ":1\r\n");
+    REQUIRE(run(d, {"PTTL", "b"}) == ":2500\r\n");
+    REQUIRE(run(d, {"EXPIREAT", "b", "999"}) == ":1\r\n");  // in the past: deleted
+    REQUIRE(run(d, {"EXISTS", "b"}) == ":0\r\n");
+}
+
+TEST_CASE("persistence commands need a persistence layer", "[dispatcher]") {
+    Store store;
+    CommandDispatcher d(store);
+    REQUIRE(run(d, {"BGSAVE"}) == "-ERR persistence is not enabled on this server\r\n");
+    REQUIRE(run(d, {"LASTSAVE"}) == "-ERR persistence is not enabled on this server\r\n");
 }
