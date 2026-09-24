@@ -98,5 +98,6 @@ Replication stays asynchronous, so an automatic failover can still lose writes t
 (cd build && ctest)                             # unit tests (Catch2)
 python3 tests/integration/test_server.py        # end-to-end tests against the real binary
 python3 tests/integration/test_replication.py   # multi-process replication tests
+python3 python-client/tests/test_cluster_client.py  # cluster client vs. scripted fake nodes
 python3 tests/integration/test_cluster.py       # multi-process cluster tests (gossip, redirects, resharding, failover)
 ```
