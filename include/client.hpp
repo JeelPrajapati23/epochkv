@@ -3,7 +3,9 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "resp_parser.hpp"
 
@@ -38,6 +40,10 @@ struct Client {
 
     // Parked by WAIT: input is still read and buffered but not executed.
     bool blocked = false;
+    // A write command that arrived while writes were paused (a manual
+    // failover is draining the replication stream). It runs, followed by
+    // anything buffered behind it, once the pause ends.
+    std::optional<std::vector<std::string>> held_command;
     // Replication offset just after this client's latest write, i.e. how far
     // replicas must have acknowledged for WAIT to count them.
     uint64_t woff = 0;
@@ -82,4 +88,10 @@ public:
     // `pending` = stream bytes already read past the handshake; they're
     // buffered, not executed, until process_buffered().
     virtual Client& adopt_master(int fd, const std::string& pending) = 0;
+
+    // While paused, clients' write commands are held (not refused) and
+    // everything else runs. Unpausing resumes the held clients before the
+    // next replies go out. Used by a master during a manual failover, so
+    // its replication stream stops growing and a replica can catch up.
+    virtual void set_writes_paused(bool paused) = 0;
 };

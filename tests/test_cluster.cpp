@@ -176,18 +176,117 @@ TEST_CASE("malformed bus messages are rejected", "[cluster]") {
     bad[1] = "not-a-node-id";
     REQUIRE_FALSE(cluster::decode(bad, out));
     bad = good;
-    bad[8] = "short bitmap";
+    bad[8] = "-1";  // replication offset
     REQUIRE_FALSE(cluster::decode(bad, out));
     bad = good;
-    bad[9] = "1";  // claims a gossip entry that isn't there
+    bad[10] = "short bitmap";
     REQUIRE_FALSE(cluster::decode(bad, out));
     bad = good;
-    bad[9] = "18446744073709551615";  // huge count must not overflow the size check
+    bad[11] = "1";  // claims a gossip entry that isn't there
+    REQUIRE_FALSE(cluster::decode(bad, out));
+    bad = good;
+    bad[11] = "18446744073709551615";  // huge count must not overflow the size check
     REQUIRE_FALSE(cluster::decode(bad, out));
     bad = good;
     bad[0] = "HELLO";
     REQUIRE_FALSE(cluster::decode(bad, out));
     REQUIRE_FALSE(cluster::decode({"PING"}, out));
+
+    // A gossip entry with an unknown health flag.
+    ping.gossip.push_back({kIdB, "10.0.0.2", 7001, 17001, false, true, false});
+    wire.clear();
+    cluster::encode(ping, wire);
+    parser.feed(wire.data(), wire.size());
+    bad = parser.try_parse_command().command;
+    REQUIRE(cluster::decode(bad, out));
+    REQUIRE(bad.back() == "master,fail?");
+    bad.back() = "master,sick";
+    REQUIRE_FALSE(cluster::decode(bad, out));
+
+    // Header-only messages carry nothing else; FAIL carries exactly a node ID.
+    cluster::Message ack = ping;
+    ack.type = cluster::MsgType::kFailoverAuthAck;
+    wire.clear();
+    cluster::encode(ack, wire);
+    parser.feed(wire.data(), wire.size());
+    bad = parser.try_parse_command().command;
+    REQUIRE(cluster::decode(bad, out));
+    bad.push_back("extra");
+    REQUIRE_FALSE(cluster::decode(bad, out));
+    cluster::Message fail = ping;
+    fail.type = cluster::MsgType::kFail;
+    fail.fail_id = "not-a-node-id";
+    wire.clear();
+    cluster::encode(fail, wire);
+    parser.feed(wire.data(), wire.size());
+    REQUIRE_FALSE(cluster::decode(parser.try_parse_command().command, out));
+}
+
+TEST_CASE("failover messages round-trip through RESP", "[cluster][failover]") {
+    auto round_trip = [](const cluster::Message& m) {
+        std::string wire;
+        cluster::encode(m, wire);
+        RespParser parser;
+        parser.feed(wire.data(), wire.size());
+        auto parsed = parser.try_parse_command();
+        REQUIRE(parsed.status == RespParser::Status::kComplete);
+        cluster::Message got;
+        REQUIRE(cluster::decode(parsed.command, got));
+        return got;
+    };
+
+    cluster::Message req;
+    req.type = cluster::MsgType::kFailoverAuthRequest;
+    req.sender = kIdB;
+    req.port = 7001;
+    req.cport = 17001;
+    req.replica = true;
+    req.master_id = kIdA;
+    req.current_epoch = 12;
+    req.config_epoch = 3;
+    req.repl_offset = 123456789012ULL;
+    req.mflags = cluster::kMsgForceAck;
+    req.slots.set(0);
+    req.slots.set(16383);
+    cluster::Message got = round_trip(req);
+    REQUIRE(got.type == cluster::MsgType::kFailoverAuthRequest);
+    REQUIRE(got.replica);
+    REQUIRE(got.master_id == kIdA);
+    REQUIRE(got.current_epoch == 12);
+    REQUIRE(got.config_epoch == 3);
+    REQUIRE(got.repl_offset == 123456789012ULL);
+    REQUIRE(got.mflags == cluster::kMsgForceAck);
+    REQUIRE(got.slots == req.slots);
+
+    for (auto type : {cluster::MsgType::kFailoverAuthAck, cluster::MsgType::kMfStart}) {
+        cluster::Message m = req;
+        m.type = type;
+        REQUIRE(round_trip(m).type == type);
+    }
+
+    cluster::Message fail = req;
+    fail.type = cluster::MsgType::kFail;
+    fail.fail_id = kIdA;
+    got = round_trip(fail);
+    REQUIRE(got.type == cluster::MsgType::kFail);
+    REQUIRE(got.fail_id == kIdA);
+
+    // A PING from a paused master, gossiping one suspect and one failed node.
+    cluster::Message ping;
+    ping.sender = kIdA;
+    ping.port = 7000;
+    ping.cport = 17000;
+    ping.mflags = cluster::kMsgPaused;
+    ping.gossip.push_back({kIdB, "10.0.0.2", 7001, 17001, false, true, false});
+    ping.gossip.push_back({std::string(40, 'c'), "10.0.0.3", 7002, 17002, true, false, true});
+    got = round_trip(ping);
+    REQUIRE(got.mflags == cluster::kMsgPaused);
+    REQUIRE(got.gossip.size() == 2);
+    REQUIRE(got.gossip[0].pfail);
+    REQUIRE_FALSE(got.gossip[0].fail);
+    REQUIRE_FALSE(got.gossip[0].replica);
+    REQUIRE(got.gossip[1].fail);
+    REQUIRE(got.gossip[1].replica);
 }
 
 // --- DUMP payloads ---------------------------------------------------------------
@@ -442,4 +541,104 @@ TEST_CASE("REPLICATE, FORGET and epoch commands check their preconditions", "[cl
     REQUIRE(f.run({"CLUSTER", "MEET", "127.0.0.1", "7001"}) == "+OK\r\n");
     REQUIRE(f.nodes().find("127.0.0.1:7001@17001 handshake") != std::string::npos);
     REQUIRE(f.run({"CLUSTER", "NOPE"}).rfind("-ERR unknown subcommand", 0) == 0);
+}
+
+// --- failover ---------------------------------------------------------------------
+
+TEST_CASE("CLUSTER FAILOVER checks its preconditions", "[cluster][failover]") {
+    Fixture master;
+    REQUIRE(master.run({"CLUSTER", "FAILOVER"}) == "-ERR You should send CLUSTER FAILOVER to a replica\r\n");
+    REQUIRE(master.run({"CLUSTER", "FAILOVER", "NOW"}) == "-ERR syntax error\r\n");
+    REQUIRE(master.run({"CLUSTER", "FAILOVER", "FORCE", "TAKEOVER"}).rfind("-ERR wrong number", 0) == 0);
+
+    Fixture orphan(kIdA + " 127.0.0.1:7000@17000 myself,slave " + std::string(40, 'c') + " 0 0 0 connected\n");
+    REQUIRE(orphan.run({"CLUSTER", "FAILOVER"}) == "-ERR I'm a replica but my master is unknown to me\r\n");
+
+    // No bus here, so the master is never connected: only FORCE / TAKEOVER.
+    Fixture replica(kIdA + " 127.0.0.1:7000@17000 myself,slave " + kIdB + " 0 0 0 connected\n" + kIdB +
+                    " 127.0.0.1:7001@17001 master - 0 0 2 connected 0-16383\n");
+    REQUIRE(replica.run({"CLUSTER", "FAILOVER"}) ==
+            "-ERR Master is down or failed, please use CLUSTER FAILOVER FORCE\r\n");
+    REQUIRE(replica.run({"CLUSTER", "FAILOVER", "FORCE"}) == "+OK\r\n");
+}
+
+TEST_CASE("CLUSTER FAILOVER TAKEOVER promotes without a vote", "[cluster][failover]") {
+    Fixture f(kIdA + " 127.0.0.1:7000@17000 myself,slave " + kIdB + " 0 0 0 connected\n" + kIdB +
+              " 127.0.0.1:7001@17001 master - 0 0 2 connected 0-16383\n"
+              "vars currentEpoch 2 lastVoteEpoch 0\n");
+    REQUIRE(f.run({"GET", "foo"}) == "-MOVED 12182 127.0.0.1:7001\r\n");
+    REQUIRE(f.run({"CLUSTER", "FAILOVER", "TAKEOVER"}) == "+OK\r\n");
+
+    // Every slot of the old master is ours, under a fresh, highest epoch.
+    std::string nodes = f.nodes();
+    REQUIRE(nodes.find(kIdA + " 127.0.0.1:7000@17000 myself,master - 0 0 3 connected 0-16383") != std::string::npos);
+    REQUIRE(nodes.find(kIdB + " 127.0.0.1:7001@17001 master - 0 0 2 disconnected\n") != std::string::npos);
+    REQUIRE(f.run({"SET", "foo", "1"}) == "+OK\r\n");
+    REQUIRE(f.run({"CLUSTER", "FAILOVER"}) == "-ERR You should send CLUSTER FAILOVER to a replica\r\n");
+
+    // And it was saved: a restart keeps the new role.
+    auto again = f.make_cluster();
+    std::string error;
+    REQUIRE(again->load_config(error));
+    std::string out;
+    again->command({"CLUSTER", "NODES"}, out);
+    REQUIRE(out.find("myself,master - 0 0 3 connected 0-16383") != std::string::npos);
+}
+
+TEST_CASE("failure flags and the last vote survive a restart", "[cluster][failover]") {
+    const std::string kIdC(40, 'c');
+    Fixture f(kIdA + " 127.0.0.1:7000@17000 myself,master - 0 0 1 connected 0-5460\n" + kIdB +
+              " 127.0.0.1:7001@17001 master,fail - 0 0 2 connected 5461-10922\n" + kIdC +
+              " 127.0.0.1:7002@17002 master,fail? - 0 0 3 connected 10923-16383\n"
+              "vars currentEpoch 7 lastVoteEpoch 6\n");
+    std::string nodes = f.nodes();
+    REQUIRE(nodes.find(kIdB + " 127.0.0.1:7001@17001 master,fail ") != std::string::npos);
+    REQUIRE(nodes.find(kIdC + " 127.0.0.1:7002@17002 master,fail? ") != std::string::npos);
+
+    // B's slots aren't served while it's FAIL, and with B and C both
+    // unreachable we're in the minority anyway: the cluster is down.
+    std::string info = f.run({"CLUSTER", "INFO"});
+    REQUIRE(info.find("cluster_state:fail") != std::string::npos);
+    REQUIRE(info.find("cluster_slots_ok:5461") != std::string::npos);
+    REQUIRE(info.find("cluster_slots_fail:5462") != std::string::npos);
+    REQUIRE(info.find("cluster_slots_pfail:5461") != std::string::npos);
+    REQUIRE(info.find("cluster_current_epoch:7") != std::string::npos);
+    REQUIRE(f.run({"GET", "k"}) == "-CLUSTERDOWN The cluster is down\r\n");
+
+    REQUIRE(f.run({"CLUSTER", "COUNT-FAILURE-REPORTS", kIdB}) == ":0\r\n");
+    REQUIRE(f.run({"CLUSTER", "COUNT-FAILURE-REPORTS", std::string(40, 'd')}) ==
+            "-ERR Unknown node " + std::string(40, 'd') + "\r\n");
+
+    REQUIRE(f.run({"CLUSTER", "SAVECONFIG"}) == "+OK\r\n");
+    std::ifstream in(f.dir.file("nodes.conf"));
+    std::stringstream saved;
+    saved << in.rdbuf();
+    REQUIRE(saved.str().find("vars currentEpoch 7 lastVoteEpoch 6") != std::string::npos);
+    REQUIRE(saved.str().find("master,fail -") != std::string::npos);
+}
+
+TEST_CASE("a FAIL master's slots take the cluster down; a healthy majority keeps it up", "[cluster][failover]") {
+    const std::string kIdC(40, 'c');
+    // Three masters, one of them FAIL: we're in the majority, but its slots
+    // are unserved.
+    Fixture f(kIdA + " 127.0.0.1:7000@17000 myself,master - 0 0 1 connected 0-5460\n" + kIdB +
+              " 127.0.0.1:7001@17001 master - 0 0 2 connected 5461-10922\n" + kIdC +
+              " 127.0.0.1:7002@17002 master,fail - 0 0 3 connected 10923-16383\n");
+    REQUIRE(f.run({"CLUSTER", "INFO"}).find("cluster_state:fail") != std::string::npos);
+
+    // Without full coverage, the slots that are still served keep working.
+    Fixture partial(kIdA + " 127.0.0.1:7000@17000 myself,master - 0 0 1 connected 0-5460\n" + kIdB +
+                    " 127.0.0.1:7001@17001 master - 0 0 2 connected 5461-10922\n" + kIdC +
+                    " 127.0.0.1:7002@17002 master,fail - 0 0 3 connected 10923-16383\n");
+    Cluster::Options copts;
+    copts.config_file = partial.dir.file("nodes.conf");
+    copts.port = 7000;
+    copts.cport = 17000;
+    copts.require_full_coverage = false;
+    partial.cluster = std::make_unique<Cluster>(partial.store, *partial.replication, copts);
+    std::string error;
+    REQUIRE(partial.cluster->load_config(error));
+    partial.dispatcher->set_cluster(partial.cluster.get());
+    REQUIRE(partial.run({"CLUSTER", "INFO"}).find("cluster_state:ok") != std::string::npos);
+    REQUIRE(partial.run({"GET", "bar"}) == "$-1\r\n");  // slot 5061: ours
 }

@@ -8,6 +8,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -207,6 +208,11 @@ void Server::run() {
         // Checked after every wakeup, not only on timeout: under constant
         // client traffic epoll_wait may never time out at all.
         run_cron_if_due();
+        // Before before_sleep, so the writes of resumed clients reach the
+        // AOF flush below ahead of their replies.
+        if (resume_held_) {
+            resume_held_clients();
+        }
         // Persist first, reply second. Deferring replies to here also
         // batches: every write from this iteration, across all clients,
         // shares one AOF write (and one fsync under appendfsync always).
@@ -329,6 +335,29 @@ void Server::handle_readable(Client& conn) {
     process_input(conn);
 }
 
+void Server::set_writes_paused(bool paused) {
+    if (paused == writes_paused_) {
+        return;
+    }
+    writes_paused_ = paused;
+    // Deferred to the loop rather than run here: the caller may be in the
+    // middle of handling a cluster bus message.
+    resume_held_ = !paused;
+    std::cout << (paused ? "client writes paused\n" : "client writes unpaused\n");
+}
+
+void Server::resume_held_clients() {
+    resume_held_ = false;
+    // fds here can't have been reused: closes only happen at the end of an
+    // iteration, and a closed client's fd is dropped from the list there.
+    for (int fd : std::exchange(held_clients_, {})) {
+        auto it = conns_.find(fd);
+        if (it != conns_.end() && it->second->held_command && !it->second->closing) {
+            process_input(*it->second);
+        }
+    }
+}
+
 void Server::process_buffered(Client& conn) {
     if (!conn.closing) {
         process_input(conn);
@@ -341,7 +370,18 @@ void Server::process_input(Client& conn) {
     // A client parked by WAIT keeps buffering input but runs nothing until
     // it's unblocked, so its replies stay in order.
     while (!conn.blocked && !conn.close_after_flush && !conn.closing) {
-        RespParser::ParseResult result = conn.parser.try_parse_command(conn.is_master ? &raw : nullptr);
+        RespParser::ParseResult result{RespParser::Status::kIncomplete, {}};
+        if (conn.held_command) {
+            // Held by a write pause: nothing behind it may overtake it.
+            if (writes_paused_) {
+                break;
+            }
+            result.status = RespParser::Status::kComplete;
+            result.command = std::move(*conn.held_command);
+            conn.held_command.reset();
+        } else {
+            result = conn.parser.try_parse_command(conn.is_master ? &raw : nullptr);
+        }
         if (result.status == RespParser::Status::kIncomplete) {
             break;
         }
@@ -365,6 +405,13 @@ void Server::process_input(Client& conn) {
             // would be read as stream data by the replica. (Only REPLCONF
             // ACK should arrive here anyway.)
             dispatcher_.dispatch(result.command, discarded, &conn);
+        } else if (writes_paused_ && dispatcher_.is_write(result.command)) {
+            // Held rather than refused: once the pause ends it runs, and
+            // if this node has lost its slots meanwhile it gets MOVED and
+            // the client retries at the new master.
+            conn.held_command = std::move(result.command);
+            held_clients_.push_back(conn.fd);
+            break;
         } else {
             uint64_t before = replication_ != nullptr ? replication_->offset() : 0;
             dispatcher_.dispatch(result.command, conn.out, &conn);
@@ -514,6 +561,7 @@ void Server::close_pending() {
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         close(fd);
         conns_.erase(it);
+        held_clients_.erase(std::remove(held_clients_.begin(), held_clients_.end(), fd), held_clients_.end());
     }
     pending_close_.clear();
 }

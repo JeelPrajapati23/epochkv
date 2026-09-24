@@ -11,11 +11,11 @@ A distributed key-value store (Redis-like) built from scratch in C++, with a Pyt
 - [x] Persistence (AOF + snapshotting)
 - [x] Replication (master-replica)
 - [x] Sharding (Redis Cluster-style hash slots, gossip, live resharding)
-- [ ] Fault tolerance (simplified leader election) — stretch goal
+- [x] Fault tolerance (failure detection and automatic failover by replica election)
 - [ ] Python client + benchmark harness (+ optional vector-search extension)
 - [ ] Benchmarks and documentation
 
-Supported commands: `PING`, `ECHO`, `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`), `GET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `DBSIZE`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE`, `REPLICAOF`, `WAIT`, `INFO`, `DUMP`, `RESTORE`, `MIGRATE`, `CLUSTER` (`INFO`, `NODES`, `SLOTS`, `MYID`, `MEET`, `ADDSLOTS[RANGE]`, `DELSLOTS[RANGE]`, `SETSLOT`, `KEYSLOT`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `REPLICATE`, `FORGET`, `SET-CONFIG-EPOCH`, `BUMPEPOCH`, `SAVECONFIG`), `ASKING`, `READONLY`, `READWRITE`.
+Supported commands: `PING`, `ECHO`, `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`), `GET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `DBSIZE`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE`, `REPLICAOF`, `WAIT`, `INFO`, `DUMP`, `RESTORE`, `MIGRATE`, `CLUSTER` (`INFO`, `NODES`, `SLOTS`, `MYID`, `MEET`, `ADDSLOTS[RANGE]`, `DELSLOTS[RANGE]`, `SETSLOT`, `KEYSLOT`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `REPLICATE`, `FORGET`, `FAILOVER`, `COUNT-FAILURE-REPORTS`, `SET-CONFIG-EPOCH`, `BUMPEPOCH`, `SAVECONFIG`), `ASKING`, `READONLY`, `READWRITE`.
 
 ## Build and run
 
@@ -77,9 +77,20 @@ python3 tools/kv_cluster.py check 127.0.0.1:7000
 - **Live resharding:** slots move while the cluster serves traffic. The target marks the slot `IMPORTING`, the source `MIGRATING`, and keys move in batches with `MIGRATE` (atomic per batch). During the move, clients get `-ASK` for keys already transferred. `SETSLOT NODE` finishes the move, and the target takes a new config epoch so its claim spreads.
 - **Replicas:** `CLUSTER REPLICATE <id>` sets up replication over the existing PSYNC stream. Replicas redirect writes to their master, and serve reads only on connections that sent `READONLY`.
 - **State on disk:** each node keeps its ID, epochs and slot map in `nodes.conf` (in `--dir`), so it rejoins with the same identity after a restart.
-- Options: `--cluster-node-timeout MS` (default 15000), `--cluster-config-file NAME`, `--cluster-require-full-coverage yes|no` (refuse key commands while any slot is unowned; default yes).
+- Options: `--cluster-node-timeout MS` (default 15000), `--cluster-config-file NAME`, `--cluster-require-full-coverage yes|no` (refuse key commands while any slot is unowned or its owner has failed; default yes).
 
-Failure detection and automatic failover aren't implemented yet: a dead master's slots stay unavailable until an operator steps in.
+## Failure detection and failover
+
+When a master dies, one of its replicas takes over its slots automatically, as in Redis Cluster:
+
+- **Suspicion (`PFAIL`):** a node that doesn't answer a PING within `--cluster-node-timeout` is flagged `fail?` by whoever noticed. Gossip spreads these suspicions, and when a master gossips a suspicion, it counts as a failure report.
+- **Agreement (`FAIL`):** once a majority of the masters serving slots report the same node within twice the node timeout, it's flagged `fail`. A `FAIL` message makes every reachable node agree at once.
+- **Election:** each replica of the failed master waits 0.5–1s, plus 1s for every sibling replica with a higher replication offset, so the most up-to-date replica usually goes first. It then increments the cluster's current epoch and asks every master for a vote. A master votes at most once per epoch and writes the vote to `nodes.conf` before sending it. A majority of votes wins.
+- **Promotion:** the winner takes the failed master's slots under the new epoch. That epoch is higher than any other, so its claim wins on every node. The other replicas follow it, continuing their replication stream with a partial resync. When the old master comes back, it learns it was replaced and becomes a replica.
+- **Safety limits:** a replica whose last contact with its master is older than `node_timeout × --cluster-replica-validity-factor` (default 10) plus the replication ping period won't try, because its data is too stale. `--cluster-replica-no-failover yes` disables automatic failover for a replica. A master that can't reach a majority of masters stops serving (`-CLUSTERDOWN`), so a partition's minority side can't keep accepting writes that the majority's failover would throw away.
+- **Manual failover:** `CLUSTER FAILOVER` on a replica pauses writes on its master, waits until the replica has applied the master's final offset, then runs the election. No acknowledged write is lost, and clients' paused writes are redirected to the new master. `FORCE` skips the master (for when it's unreachable). `TAKEOVER` also skips the vote (for when a majority of masters is gone).
+
+Replication stays asynchronous, so an automatic failover can still lose writes that the dead master acknowledged but never sent to its replica.
 
 ## Tests
 
@@ -87,5 +98,5 @@ Failure detection and automatic failover aren't implemented yet: a dead master's
 (cd build && ctest)                             # unit tests (Catch2)
 python3 tests/integration/test_server.py        # end-to-end tests against the real binary
 python3 tests/integration/test_replication.py   # multi-process replication tests
-python3 tests/integration/test_cluster.py       # multi-process cluster tests (gossip, redirects, live resharding)
+python3 tests/integration/test_cluster.py       # multi-process cluster tests (gossip, redirects, resharding, failover)
 ```

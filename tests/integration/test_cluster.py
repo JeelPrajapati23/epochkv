@@ -86,14 +86,49 @@ class Node:
         self.proc.send_signal(signal.SIGTERM)
         return self.proc.wait(timeout=10)
 
+    def me(self):
+        """This node's own CLUSTER NODES entry."""
+        return next(x for x in self.nodes() if "myself" in x["flags"])
+
+    def view_of(self, node_id):
+        return next((x for x in self.nodes() if x["id"] == node_id), None)
+
+    def info(self, *section):
+        text = self.call("INFO", *section).decode()
+        return dict(line.split(":", 1) for line in text.splitlines() if ":" in line)
+
+    def cluster_info(self):
+        text = self.call("CLUSTER", "INFO").decode()
+        return dict(line.split(":", 1) for line in text.splitlines() if ":" in line)
+
+    def get_readonly(self, key):
+        c = self.conn()
+        try:
+            c.call("READONLY")
+            return c.call_raw("GET", key)
+        finally:
+            c.close()
+
 
 def key_in_slot_range(node, lo, hi, prefix="k"):
     """Some key whose slot is in [lo, hi]."""
     for i in range(100000):
         key = "%s%d" % (prefix, i)
-        if lo <= node.call("CLUSTER", "KEYSLOT", key) <= hi:
+        if lo <= kv_cluster.key_slot(key) <= hi:
             return key
     raise AssertionError("no key found")
+
+
+def keys_in_slots(slots, count, prefix="k"):
+    """`count` keys whose slots are all in the set `slots`."""
+    keys = []
+    i = 0
+    while len(keys) < count:
+        key = "%s%d" % (prefix, i)
+        if kv_cluster.key_slot(key) in slots:
+            keys.append(key)
+        i += 1
+    return keys
 
 
 class ClusterTest(unittest.TestCase):
@@ -117,6 +152,34 @@ class ClusterTest(unittest.TestCase):
 
     def wait_converged(self, nodes, timeout=20):
         wait_until(lambda: converged([n.addr for n in nodes]), timeout, "convergence")
+
+    def wait_serving(self, nodes, timeout=20):
+        """Like wait_converged, but tolerates dead nodes the survivors still
+        list: every one of `nodes` reports ok and they agree on the slots."""
+        def ok():
+            maps = []
+            for n in nodes:
+                if n.cluster_info()["cluster_state"] != "ok":
+                    return False
+                maps.append({s: x["id"] for x in n.nodes() for s in x["slots"]})
+            return all(m == maps[0] for m in maps)
+        wait_until(ok, timeout, "the surviving nodes serving every slot")
+
+    def wait_replicated(self, master, replica, timeout=10):
+        def caught_up():
+            return (replica.info("replication").get("slave_repl_offset") ==
+                    master.info("replication")["master_repl_offset"])
+        wait_until(caught_up, timeout, "replica catching up with its master")
+
+    def add_replica(self, master, cluster_nodes):
+        """A new node that joins the cluster and replicates `master`."""
+        n = self.node()
+        n.call("CLUSTER", "MEET", "127.0.0.1", master.port, master.cport)
+        n_id = n.myid()
+        wait_until(lambda: all(x.view_of(n_id) is not None for x in cluster_nodes) and
+                   len(n.nodes()) == len(cluster_nodes) + 1, 15, "the new node joining")
+        self.assertEqual(n.call("CLUSTER", "REPLICATE", master.myid()), "OK")
+        return n
 
     # --- tests ------------------------------------------------------------------
 
@@ -344,6 +407,186 @@ class ClusterTest(unittest.TestCase):
         for n in (a, b):
             self.assertNotIn(extra_id, [x["id"] for x in n.nodes()])
         self.wait_converged([a, b])
+
+    # --- failover -------------------------------------------------------------
+
+    def test_automatic_failover_then_old_master_rejoins_as_replica(self):
+        m1, m2, m3, r1, r2, r3 = self.cluster(3, replicas=1)
+        m1_id, r1_id = m1.myid(), r1.myid()
+        self.assertEqual(r1.me()["master"], m1_id)
+        m1_slots = sorted(m1.me()["slots"])
+        epoch_before = max(x["epoch"] for x in m2.nodes())
+
+        client = ClusterClient(m2.addr)
+        for i in range(300):
+            client.call("SET", "key:%d" % i, "v%d" % i)
+        self.wait_replicated(m1, r1)
+
+        started = time.time()
+        m1.kill()
+        survivors = [m2, m3, r1, r2, r3]
+        # Failure detected, agreed on by a majority, election won, new
+        # config spread: every survivor sees r1 owning m1's old slots.
+        wait_until(lambda: all(n.owner_of(m1_slots[0]) == r1_id for n in survivors), 30, "r1 taking over")
+        took = time.time() - started
+        self.wait_serving(survivors)
+
+        me = r1.me()
+        self.assertIn("master", me["flags"])
+        self.assertEqual(sorted(me["slots"]), m1_slots)
+        self.assertGreater(me["epoch"], epoch_before)  # won with a fresh, highest epoch
+        for n in (m2, m3, r2, r3):
+            self.assertIn("fail", n.view_of(m1_id)["flags"])
+        self.assertEqual(r1.info("replication")["role"], "master")
+        # node_timeout is 2s: detection ~2-3s, then a 0.5-1s election delay.
+        self.assertLess(took, 15)
+
+        # Nothing that had reached the replica was lost, and m1's slots
+        # take writes again.
+        for i in range(300):
+            self.assertEqual(client.call("GET", "key:%d" % i), b"v%d" % i)
+        after = keys_in_slots(set(m1_slots), 20, prefix="after")
+        for k in after:
+            self.assertEqual(client.call("SET", k, "new"), "OK")
+        client.close()
+
+        # m1 comes back still believing it owns its slots, under an older
+        # epoch. It must learn it was replaced and turn into r1's replica.
+        m1b = self.node(data_dir=m1.dir, port=m1.port, cport=m1.cport)
+        wait_until(lambda: m1b.me()["master"] == r1_id and "slave" in m1b.me()["flags"], 20,
+                   "the old master becoming a replica of the new one")
+        wait_until(lambda: all(m1b.get_readonly(k) == b"new" for k in after), 20, "m1 resyncing from r1")
+        self.assertEqual(m1b.call("DBSIZE"), r1.call("DBSIZE"))
+        # Back and serving nothing: nobody holds its FAIL flag against it.
+        wait_until(lambda: all("fail" not in n.view_of(m1_id)["flags"] for n in survivors), 20,
+                   "the FAIL flag being cleared")
+        self.wait_converged(survivors + [m1b])
+
+    def test_manual_failover_loses_no_acknowledged_writes(self):
+        m1, m2, m3, r1, r2, r3 = self.cluster(3, replicas=1)
+        m1_id, r1_id = m1.myid(), r1.myid()
+        keys = keys_in_slots(set(m1.me()["slots"]), 50, prefix="mf")
+
+        # A writer hammers m1's slots through the whole failover. Every write
+        # it saw acknowledged must survive: the master pauses writes, the
+        # replica catches up to the master's final offset, and only then
+        # takes over. Writes sent during the pause are held, then redirected.
+        stop = threading.Event()
+        acked = {}
+        errors = []
+        progress = {"after": 0}
+        promoted = threading.Event()
+
+        def writer():
+            cc = ClusterClient(m2.addr)
+            n = 0
+            try:
+                while not stop.is_set():
+                    n += 1
+                    k = keys[n % len(keys)]
+                    if cc.call("SET", k, "v%d" % n) != "OK":
+                        errors.append((k, n))
+                    acked[k] = "v%d" % n
+                    if promoted.is_set():
+                        progress["after"] += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e))
+            finally:
+                cc.close()
+
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            time.sleep(0.5)
+            self.assertEqual(r1.call("CLUSTER", "FAILOVER"), "OK")
+            wait_until(lambda: "master" in r1.me()["flags"], 10, "r1 promoted")
+            promoted.set()
+            wait_until(lambda: m1.me()["master"] == r1_id, 10, "m1 demoted to r1's replica")
+            time.sleep(0.5)
+        finally:
+            stop.set()
+            t.join(30)
+        self.assertEqual(errors, [])
+        self.assertGreater(progress["after"], 0)  # writes kept flowing to the new master
+
+        check = ClusterClient(m3.addr)
+        for k, v in acked.items():
+            self.assertEqual(check.call("GET", k), v.encode(), k)
+        check.close()
+        self.wait_replicated(r1, m1)
+        self.wait_converged([m1, m2, m3, r1, r2, r3])
+        self.assertEqual(m1.view_of(m1_id)["master"], r1_id)
+
+    def test_failover_force_without_waiting_for_fail(self):
+        m1, m2, m3, r1, r2, r3 = self.cluster(3, replicas=1)
+        r1_id = r1.myid()
+        slot = min(m1.me()["slots"])
+        m1.kill()
+        # Right away, long before m1 could be flagged FAIL: the masters vote
+        # anyway (FORCEACK), so the outage is just the election.
+        self.assertEqual(r1.call("CLUSTER", "FAILOVER", "FORCE"), "OK")
+        wait_until(lambda: all(n.owner_of(slot) == r1_id for n in (m2, m3, r1)), 10, "forced failover")
+        self.wait_serving([m2, m3, r1, r2, r3])
+
+    def test_failover_takeover_needs_no_vote(self):
+        m1, m2, m3, r1, r2, r3 = self.cluster(3, replicas=1)
+        m2_id, r2_id = m2.myid(), r2.myid()
+        slot = min(m2.me()["slots"])
+        # Two of three masters gone: no election could reach a majority.
+        m1.kill()
+        m3.kill()
+        self.assertEqual(r2.call("CLUSTER", "FAILOVER", "TAKEOVER"), "OK")
+        me = r2.me()
+        self.assertIn("master", me["flags"])
+        self.assertIn(slot, me["slots"])
+        # m2 was alive: it sees the higher-epoch claim and steps down.
+        wait_until(lambda: m2.me()["master"] == r2_id, 10, "m2 stepping down")
+        wait_until(lambda: r2.view_of(m2_id)["master"] == r2_id, 10, "r2 learning m2 is now its replica")
+
+    def test_master_in_minority_stops_accepting_writes(self):
+        a, b, c = self.cluster(3)
+        key = key_in_slot_range(a, min(a.me()["slots"]), max(a.me()["slots"]))
+        self.assertEqual(a.call("SET", key, "before"), "OK")
+        b.kill()
+        c.kill()
+        # a can't reach a majority of masters: the others may be failing
+        # over its slots right now, so accepting a write could lose it.
+        wait_until(lambda: a.cluster_info()["cluster_state"] == "fail", 10, "a noticing it's alone")
+        self.assertEqual(str(a.call("SET", key, "during")), "CLUSTERDOWN The cluster is down")
+        self.assertEqual(str(a.call("GET", key)), "CLUSTERDOWN The cluster is down")
+
+    def test_other_replicas_follow_the_new_master(self):
+        m1, m2, m3 = self.cluster(3)
+        ra = self.add_replica(m1, [m1, m2, m3])
+        rb = self.add_replica(m1, [m1, m2, m3, ra])
+        everyone = [m1, m2, m3, ra, rb]
+        self.wait_converged(everyone)
+        m1_slots = set(m1.me()["slots"])
+
+        client = ClusterClient(m2.addr)
+        for k in keys_in_slots(m1_slots, 100, prefix="pre"):
+            client.call("SET", k, "x")
+        self.wait_replicated(m1, ra)
+        self.wait_replicated(m1, rb)
+
+        m1.kill()
+        slot = min(m1_slots)
+        ids = {ra.myid(): ra, rb.myid(): rb}
+        wait_until(lambda: m2.owner_of(slot) in ids, 30, "one replica winning the election")
+        winner = ids[m2.owner_of(slot)]
+        loser = ra if winner is rb else rb
+        winner_id = winner.myid()
+        # The loser's master was replaced: it follows the winner, and can
+        # continue its old replication stream there (PSYNC with the
+        # winner's previous replication ID) instead of a full resync.
+        wait_until(lambda: loser.me()["master"] == winner_id, 20, "the other replica following the winner")
+        post = keys_in_slots(m1_slots, 10, prefix="post")
+        for k in post:
+            client.call("SET", k, "y")
+        wait_until(lambda: all(loser.get_readonly(k) == b"y" for k in post), 20, "replication from the winner")
+        self.assertGreaterEqual(int(winner.info("replication")["sync_partial_ok"]), 1)
+        client.close()
+        self.wait_serving([m2, m3, ra, rb])
 
 
 if __name__ == "__main__":

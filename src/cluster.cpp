@@ -41,6 +41,25 @@ constexpr std::chrono::seconds kMinHandshakeTimeout{1};
 constexpr uint64_t kRandomPingEvery = 10;
 constexpr size_t kRandomPingSample = 5;
 
+// Failure reports older than node_timeout * this are ignored: an opinion
+// only counts toward a quorum while it's fresh.
+constexpr int kFailReportValidityMult = 2;
+// A FAIL master that still has its slots (nobody took over) is trusted
+// again once it's reachable and this many node timeouts have passed.
+constexpr int kFailUndoTimeMult = 2;
+// How long a manual failover may take before it's abandoned; the master
+// unpauses its clients at the same moment.
+constexpr std::chrono::seconds kManualFailoverTimeout{5};
+// A master starting up reports the cluster down for this long, so a stale
+// config (say, slots it lost while it was dead) gets corrected by gossip
+// before it accepts writes for them.
+constexpr std::chrono::seconds kWritableDelay{2};
+// After being cut off from the majority, a master waits node_timeout
+// (clamped to this range) before accepting writes again, for the same reason.
+constexpr std::chrono::milliseconds kMinRejoinDelay{500};
+constexpr std::chrono::milliseconds kMaxRejoinDelay{5000};
+constexpr std::chrono::milliseconds kMinAuthTimeout{2000};
+
 std::chrono::steady_clock::time_point now() {
     return std::chrono::steady_clock::now();
 }
@@ -168,6 +187,12 @@ void Cluster::del_node(Node* n) {
     if (n->link != nullptr) {
         free_link(n->link);
     }
+    for (auto& [id, other] : nodes_) {
+        other->fail_reports.erase(n->id);
+    }
+    if (mf_replica_ == n) {
+        reset_manual_failover();
+    }
     nodes_.erase(n->id);  // destroys n
     todo_save();
     todo_update_state_ = true;
@@ -216,6 +241,9 @@ void Cluster::set_slot(int slot, Node* owner) {
 }
 
 void Cluster::set_as_replica_of(Node* master) {
+    // A master in the middle of a manual failover has just been replaced:
+    // unpause its clients so their held writes get redirected.
+    reset_manual_failover();
     for (int slot = 0; slot < kSlots; ++slot) {
         if (owner_[slot] == myself_) {
             set_slot(slot, nullptr);
@@ -269,6 +297,9 @@ void Cluster::update_slots_config_with(Node* sender, uint64_t config_epoch, cons
     if (sender == myself_) {
         return;  // nobody else decides what we own
     }
+    // Our shard's master: ourselves, or the master we replicate.
+    Node* our_master = master_of(myself_);
+    bool took_from_our_master = false;
     std::vector<int> dirty;
     for (int slot = 0; slot < kSlots; ++slot) {
         if (!slots[slot] || owner_[slot] == sender) {
@@ -286,10 +317,32 @@ void Cluster::update_slots_config_with(Node* sender, uint64_t config_epoch, cons
                 migrating_to_[slot] = nullptr;
                 todo_broadcast_ = true;
             }
+            if (owner_[slot] != nullptr && owner_[slot] == our_master) {
+                took_from_our_master = true;
+            }
             set_slot(slot, sender);
             todo_save();
         }
     }
+
+    // Our shard lost its last slot to `sender`: `sender` replaced our master
+    // (a failover), or took us over (we were the failed master, back
+    // online). Either way we now follow it. A demoted master keeps its keys
+    // for now: the resync from the new master replaces them all.
+    if (took_from_our_master && our_master != nullptr && our_master->slots.none()) {
+        if (myself_->is(kMaster)) {
+            std::cout << "cluster: lost my last slot to " << sender->id << "; becoming its replica\n";
+            set_as_replica_of(sender);
+            return;
+        }
+        if (myself_->master_id != sender->id) {
+            std::cout << "cluster: my master " << our_master->id << " was replaced by " << sender->id
+                      << "; following it\n";
+            set_as_replica_of(sender);
+        }
+        return;
+    }
+
     // Keys in slots we just lost can't be reached through us any more, and
     // the new owner is the authority for them. A replica's master sends it
     // the DELs, so only a master deletes.
@@ -320,13 +373,57 @@ void Cluster::handle_epoch_collision(Node* sender) {
               << "\n";
 }
 
+int Cluster::cluster_size() const {
+    int size = 0;
+    for (const auto& [id, n] : nodes_) {
+        if (n->is(kMaster) && n->slots.any()) {
+            ++size;
+        }
+    }
+    return size;
+}
+
 void Cluster::update_state() {
     todo_update_state_ = false;
-    bool ok = !options_.require_full_coverage ||
-              std::all_of(owner_.begin(), owner_.end(), [](const Node* n) { return n != nullptr; });
-    if (ok != state_ok_) {
-        std::cout << "cluster state changed: " << (ok ? "ok" : "fail") << "\n";
+    auto t = now();
+    // A slot whose owner is FAIL isn't served, even though it's assigned.
+    bool ok = !options_.require_full_coverage || std::all_of(owner_.begin(), owner_.end(), [](const Node* n) {
+                  return n != nullptr && !n->is(kFail);
+              });
+
+    // On the minority side of a partition, stop serving: the majority may
+    // be promoting our replicas right now, and any write we accepted would
+    // be lost when we rejoin as a replica. This caps the window of lost
+    // writes to about one node timeout.
+    int size = 0;
+    int reachable = 0;
+    for (const auto& [id, n] : nodes_) {
+        if (n->is(kMaster) && n->slots.any()) {
+            ++size;
+            if (!n->is(kPFail | kFail)) {
+                ++reachable;
+            }
+        }
     }
+    if (size > 0 && reachable < size / 2 + 1) {
+        ok = false;
+        among_minority_time_ = t;
+    }
+
+    if (ok == state_ok_) {
+        return;
+    }
+    // A master turning "ok" waits a little first (only with the bus up, so
+    // unit tests see the state right away): after startup, or after being
+    // in the minority, its slot config may be stale, and gossip needs a
+    // moment to tell it about a failover that happened meanwhile.
+    if (ok && myself_->is(kMaster) && host_ != nullptr) {
+        auto rejoin_delay = std::clamp<std::chrono::milliseconds>(options_.node_timeout, kMinRejoinDelay, kMaxRejoinDelay);
+        if (t < writable_after_ || t - among_minority_time_ < rejoin_delay) {
+            return;
+        }
+    }
+    std::cout << "cluster state changed: " << (ok ? "ok" : "fail") << "\n";
     state_ok_ = ok;
 }
 
@@ -428,6 +525,8 @@ bool Cluster::start(ClientHost* host) {
     }
     std::cout << "cluster bus listening on " << options_.bind_addr << ":" << options_.cport << ", node id "
               << myself_->id << "\n";
+    writable_after_ = now() + kWritableDelay;
+    state_ok_ = false;
     follow_master();
     update_state();
     return true;
@@ -470,6 +569,12 @@ void Cluster::connect_link(Node* n) {
     addr.sin_port = htons(n->cport);
     if (inet_pton(AF_INET, n->ip.c_str(), &addr.sin_addr) != 1) {
         return;
+    }
+    // Connecting means a PING is on its way. Count the wait from now, so a
+    // node we can't even connect to still times out and gets flagged PFAIL
+    // (an older outstanding PING keeps its earlier time).
+    if (n->ping_sent == SteadyTime{} && !n->is(kHandshake)) {
+        n->ping_sent = now();
     }
     // Non-blocking, like the replica's link to its master: a dead node must
     // not stall the event loop for a TCP connect timeout.
@@ -637,11 +742,23 @@ Message Cluster::header(MsgType type) const {
     m.replica = myself_->is(kReplica);
     m.master_id = myself_->master_id;
     m.current_epoch = current_epoch_;
+    m.repl_offset = replication_.offset();
+    if (myself_->is(kMaster) && mf_end_) {
+        m.mflags |= cluster::kMsgPaused;
+    }
     if (const Node* master = master_of(myself_)) {
         m.config_epoch = master->config_epoch;
         m.slots = master->slots;
     }
     return m;
+}
+
+void Cluster::broadcast(const Message& msg) {
+    for (const auto& [id, n] : nodes_) {
+        if (n.get() != myself_ && n->link != nullptr && !n->link->connecting && !n->is(kHandshake)) {
+            send(n->link, msg);
+        }
+    }
 }
 
 void Cluster::send_ping(Link* l, MsgType type) {
@@ -654,16 +771,21 @@ void Cluster::send_ping(Link* l, MsgType type) {
         if (n.get() == myself_ || n.get() == l->node || n->is(kHandshake | kNoAddr)) {
             continue;
         }
-        if (n->link == nullptr && n->slots.none()) {
+        if (n->link == nullptr && n->slots.none() && !n->is(kPFail)) {
             continue;  // unreachable and serving nothing: not worth spreading
         }
         candidates.push_back(n.get());
     }
     std::shuffle(candidates.begin(), candidates.end(), rng_);
     size_t wanted = std::max<size_t>(3, nodes_.size() / 10);
-    candidates.resize(std::min(wanted, candidates.size()));
+    // Nodes we suspect always go along, on top of the random ones: failure
+    // reports have to reach a majority of masters within the report
+    // validity window, and random picks alone could keep missing one.
+    std::stable_partition(candidates.begin(), candidates.end(), [](const Node* n) { return n->is(kPFail); });
+    size_t suspects = std::count_if(candidates.begin(), candidates.end(), [](const Node* n) { return n->is(kPFail); });
+    candidates.resize(std::min(std::max(wanted, suspects), candidates.size()));
     for (const Node* n : candidates) {
-        m.gossip.push_back({n->id, n->ip, n->port, n->cport, n->is(kReplica)});
+        m.gossip.push_back({n->id, n->ip, n->port, n->cport, n->is(kReplica), n->is(kPFail), n->is(kFail)});
     }
     if (type == MsgType::kPing && l->node != nullptr && l->node->ping_sent == SteadyTime{}) {
         l->node->ping_sent = now();
@@ -709,6 +831,17 @@ void Cluster::process_packet(Link* l, const Message& msg) {
             sender->cport = msg.cport;
             todo_save();
         }
+        sender->repl_offset = msg.repl_offset;
+        // Our master, mid manual failover, has paused its writes: the
+        // offset it reports now is final. We may take over once we've
+        // applied exactly that much of its stream.
+        if (myself_->is(kReplica) && myself_->master_id == sender->id && (msg.mflags & cluster::kMsgPaused) &&
+            mf_end_ && !mf_master_offset_) {
+            mf_master_offset_ = msg.repl_offset;
+            todo_handle_manual_failover_ = true;
+            std::cout << "cluster: received the master's final replication offset " << msg.repl_offset
+                      << " for the manual failover\n";
+        }
     }
 
     if (msg.type == MsgType::kPing || msg.type == MsgType::kMeet) {
@@ -752,6 +885,57 @@ void Cluster::process_packet(Link* l, const Message& msg) {
         return;
     }
 
+    if (msg.type == MsgType::kFail) {
+        Node* failing = sender != nullptr ? lookup(msg.fail_id) : nullptr;
+        if (failing != nullptr && failing != myself_ && !failing->is(kFail) && !failing->is(kHandshake)) {
+            std::cout << "cluster: FAIL message received from " << sender->id << " about " << failing->id << "\n";
+            failing->flags = (failing->flags & ~kPFail) | kFail;
+            failing->fail_time = now();
+            todo_update_state_ = true;
+            todo_handle_failover_ = true;
+            todo_save();
+        }
+        return;
+    }
+
+    if (msg.type == MsgType::kFailoverAuthRequest) {
+        if (sender != nullptr) {
+            send_failover_auth_if_needed(sender, msg);
+        }
+        return;
+    }
+
+    if (msg.type == MsgType::kFailoverAuthAck) {
+        // Only votes from masters serving slots count, and only for the
+        // election we're running now (a late vote from an older one says
+        // nothing about this one).
+        if (sender != nullptr && sender->is(kMaster) && sender->slots.any() &&
+            msg.current_epoch >= failover_auth_epoch_ && failover_auth_sent_) {
+            ++failover_auth_count_;
+            std::cout << "cluster: got a failover vote from " << sender->id << " (" << failover_auth_count_ << "/"
+                      << needed_quorum() << ")\n";
+            todo_handle_failover_ = true;
+        }
+        return;
+    }
+
+    if (msg.type == MsgType::kMfStart) {
+        // Our replica asks for a manual failover: pause writes so our
+        // offset stops moving, and tell it that offset (every PING we send
+        // it until the failover ends carries it, flagged PAUSED).
+        if (sender == nullptr || !sender->is(kReplica) || sender->master_id != myself_->id) {
+            return;
+        }
+        reset_manual_failover();
+        mf_end_ = now() + kManualFailoverTimeout;
+        mf_replica_ = sender;
+        pause_writes(true);
+        std::cout << "cluster: manual failover requested by replica " << sender->id << "\n";
+        Link* to = sender->link != nullptr && !sender->link->connecting ? sender->link : l;
+        send_ping(to, MsgType::kPing);
+        return;
+    }
+
     // PING / PONG / MEET.
     if (Node* n = l->node) {
         if (n->is(kHandshake)) {
@@ -783,6 +967,13 @@ void Cluster::process_packet(Link* l, const Message& msg) {
         if (msg.type == MsgType::kPong) {
             n->pong_received = now();
             n->ping_sent = SteadyTime{};
+            if (n->is(kPFail)) {
+                std::cout << "cluster: node " << n->id << " is reachable again\n";
+                n->flags &= ~kPFail;
+                todo_update_state_ = true;
+            } else if (n->is(kFail)) {
+                clear_node_failure_if_needed(n);
+            }
         }
     }
     if (sender == nullptr) {
@@ -825,13 +1016,31 @@ void Cluster::process_packet(Link* l, const Message& msg) {
         }
         handle_epoch_collision(sender);
     }
-    process_gossip(msg);
+    process_gossip(sender, msg);
 }
 
-void Cluster::process_gossip(const Message& msg) {
+void Cluster::process_gossip(Node* sender, const Message& msg) {
     auto t = now();
     for (const cluster::GossipEntry& g : msg.gossip) {
-        if (g.id == myself_->id || lookup(g.id) != nullptr) {
+        if (g.id == myself_->id) {
+            continue;
+        }
+        if (Node* n = lookup(g.id)) {
+            // A master's view of another node's health is a failure report.
+            // Replicas' opinions don't count: the quorum is of masters, as
+            // it's the masters that will vote on a failover.
+            if (sender->is(kMaster) && !n->is(kHandshake)) {
+                if (g.pfail || g.fail) {
+                    if (n->fail_reports.count(sender->id) == 0) {
+                        std::cout << "cluster: node " << sender->id << " reported node " << n->id
+                                  << " as not reachable\n";
+                    }
+                    n->fail_reports[sender->id] = t;
+                    mark_node_as_failing_if_needed(n);
+                } else {
+                    n->fail_reports.erase(sender->id);
+                }
+            }
             continue;
         }
         auto banned = blacklist_.find(g.id);
@@ -928,11 +1137,386 @@ void Cluster::cron() {
         }
     }
 
+    detect_failures();
+
+    // Mid manual failover, the master keeps telling its replica the final
+    // offset (in case the first PING was lost with a reconnecting link).
+    if (myself_->is(kMaster) && mf_end_ && mf_replica_ != nullptr && usable(mf_replica_)) {
+        send_ping(mf_replica_->link, MsgType::kPing);
+    }
+    manual_failover_check_timeout();
+    if (myself_->is(kReplica)) {
+        handle_manual_failover();
+        handle_replica_failover();
+    }
+
     follow_master();
     update_state();
 }
 
+void Cluster::detect_failures() {
+    auto t = now();
+    for (const auto& [id, node] : nodes_) {
+        Node* n = node.get();
+        if (n == myself_ || n->is(kHandshake | kNoAddr | kPFail | kFail)) {
+            continue;
+        }
+        if (n->ping_sent != SteadyTime{} && t - n->ping_sent > options_.node_timeout) {
+            std::cout << "cluster: *** node " << n->id << " possibly failing (no PONG for "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(t - n->ping_sent).count() << "ms)\n";
+            n->flags |= kPFail;
+            todo_update_state_ = true;
+            mark_node_as_failing_if_needed(n);
+        }
+    }
+}
+
+size_t Cluster::count_fail_reports(Node* n) {
+    auto t = now();
+    auto validity = options_.node_timeout * kFailReportValidityMult;
+    for (auto it = n->fail_reports.begin(); it != n->fail_reports.end();) {
+        it = t - it->second > validity ? n->fail_reports.erase(it) : std::next(it);
+    }
+    return n->fail_reports.size();
+}
+
+// PFAIL -> FAIL once enough masters agree (Redis's markNodeAsFailingIfNeeded).
+// Our own opinion counts too if we're a master. The FAIL broadcast then
+// overrides everyone's slower local detection, so the whole cluster flips
+// at once and the replicas can start their election.
+void Cluster::mark_node_as_failing_if_needed(Node* n) {
+    if (!n->is(kPFail) || n->is(kFail)) {
+        return;
+    }
+    size_t failures = count_fail_reports(n) + (myself_->is(kMaster) ? 1 : 0);
+    if (failures < static_cast<size_t>(needed_quorum())) {
+        return;
+    }
+    std::cout << "cluster: marking node " << n->id << " as failing (quorum reached: " << failures << "/"
+              << needed_quorum() << ")\n";
+    n->flags = (n->flags & ~kPFail) | kFail;
+    n->fail_time = now();
+    Message m = header(MsgType::kFail);
+    m.fail_id = n->id;
+    broadcast(m);
+    todo_update_state_ = true;
+    todo_handle_failover_ = true;
+    todo_save();
+}
+
+// A FAIL node that answers again (Redis's clearNodeFailureIfNeeded). A
+// replica, or a master without slots, is simply back. A master that still
+// owns slots means no replica took over; it's trusted again only after a
+// grace period, so a flapping master can't cancel an election in progress.
+void Cluster::clear_node_failure_if_needed(Node* n) {
+    if (!n->is(kFail)) {
+        return;
+    }
+    bool clear = false;
+    if (n->is(kReplica) || n->slots.none()) {
+        std::cout << "cluster: clear FAIL state for node " << n->id << ": "
+                  << (n->is(kReplica) ? "replica" : "master without slots") << " is reachable again\n";
+        clear = true;
+    } else if (now() - n->fail_time > options_.node_timeout * kFailUndoTimeMult) {
+        std::cout << "cluster: clear FAIL state for node " << n->id
+                  << ": is reachable again and nobody is serving its slots after some time\n";
+        clear = true;
+    }
+    if (clear) {
+        n->flags &= ~kFail;
+        todo_update_state_ = true;
+        todo_save();
+    }
+}
+
+// --- failover, replica side -----------------------------------------------------------
+
+void Cluster::cant_failover(const std::string& reason) {
+    if (reason != cant_failover_reason_ && !reason.empty()) {
+        std::cout << "cluster: currently unable to failover: " << reason << "\n";
+    }
+    cant_failover_reason_ = reason;
+}
+
+// How many sibling replicas (same master, not failed) have applied more of
+// the master's stream than we have. Rank 0 is the most up to date; each
+// rank adds a second to the election delay, so the best replica usually
+// asks first and wins, losing the fewest writes.
+int Cluster::replica_rank() const {
+    const Node* master = lookup(myself_->master_id);
+    if (master == nullptr) {
+        return 0;
+    }
+    uint64_t mine = replication_.offset();
+    int rank = 0;
+    for (const auto& [id, n] : nodes_) {
+        if (n.get() != myself_ && n->is(kReplica) && n->master_id == master->id && !n->is(kFail) &&
+            n->repl_offset > mine) {
+            ++rank;
+        }
+    }
+    return rank;
+}
+
+// Redis's clusterHandleSlaveFailover(): run from the cron and whenever
+// something relevant changes (a FAIL, a vote). Schedules an election,
+// sends the vote requests when it's due, and promotes us on a majority.
+void Cluster::handle_replica_failover() {
+    todo_handle_failover_ = false;
+    if (host_ == nullptr || !myself_->is(kReplica)) {
+        return;
+    }
+    auto t = now();
+    Node* master = lookup(myself_->master_id);
+    bool manual = mf_end_ && mf_can_start_;
+    if (master == nullptr || master->slots.none() || (!master->is(kFail) && !manual) ||
+        (options_.replica_no_failover && !manual)) {
+        cant_failover("");
+        return;
+    }
+
+    auto auth_timeout = std::max<std::chrono::milliseconds>(options_.node_timeout * 2, kMinAuthTimeout);
+    auto auth_retry_time = auth_timeout * 2;
+
+    // How stale our copy is. The master was unreachable for about a node
+    // timeout before it was flagged FAIL anyway, so that much doesn't count.
+    auto data_age = t - replication_.master_last_contact();
+    if (data_age > options_.node_timeout) {
+        data_age -= options_.node_timeout;
+    }
+    if (options_.replica_validity_factor > 0 && !manual &&
+        data_age > replication_.ping_period() + options_.node_timeout * options_.replica_validity_factor) {
+        cant_failover("my data is too old: last contact with the master " +
+                      std::to_string(std::chrono::duration_cast<std::chrono::seconds>(data_age).count()) +
+                      "s ago (see --cluster-replica-validity-factor)");
+        return;
+    }
+
+    // No election yet, or the last one is long over: schedule one. The fixed
+    // 500ms lets the FAIL message reach every master first; the random part
+    // makes it unlikely that two replicas ask in the same instant and split
+    // the vote.
+    if (!failover_auth_time_ || t - *failover_auth_time_ > auth_retry_time) {
+        failover_auth_rank_ = replica_rank();
+        failover_auth_time_ = t + std::chrono::milliseconds(500 + rng_() % 500) + std::chrono::seconds(failover_auth_rank_);
+        failover_auth_count_ = 0;
+        failover_auth_sent_ = false;
+        if (mf_end_) {
+            // Manual: the replica is known to be in sync; no need to wait.
+            failover_auth_time_ = t;
+            failover_auth_rank_ = 0;
+            todo_handle_failover_ = true;
+        }
+        std::cout << "cluster: start of election delayed for "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(*failover_auth_time_ - t).count()
+                  << "ms (rank #" << failover_auth_rank_ << ", offset " << replication_.offset() << ")\n";
+        // Let our siblings know our offset, so their ranks are right.
+        broadcast_pong();
+        return;
+    }
+
+    // A sibling's offset overtook ours while we were waiting: step back.
+    if (!failover_auth_sent_ && !mf_end_) {
+        int rank = replica_rank();
+        if (rank > failover_auth_rank_) {
+            *failover_auth_time_ += std::chrono::seconds(rank - failover_auth_rank_);
+            std::cout << "cluster: replica rank updated to #" << rank << ", election delayed further\n";
+            failover_auth_rank_ = rank;
+        }
+    }
+
+    if (t < *failover_auth_time_) {
+        return;
+    }
+    if (t - *failover_auth_time_ > auth_timeout) {
+        cant_failover("election timed out, waiting for the retry time");
+        return;
+    }
+
+    if (!failover_auth_sent_) {
+        // A new epoch for this election: every master votes at most once
+        // per epoch, so at most one replica can collect a majority in it.
+        ++current_epoch_;
+        failover_auth_epoch_ = current_epoch_;
+        std::cout << "cluster: starting a failover election for epoch " << current_epoch_ << "\n";
+        request_failover_auth();
+        failover_auth_sent_ = true;
+        todo_save();
+        todo_update_state_ = true;
+        return;
+    }
+
+    if (failover_auth_count_ >= needed_quorum()) {
+        std::cout << "cluster: failover election won\n";
+        if (myself_->config_epoch < failover_auth_epoch_) {
+            myself_->config_epoch = failover_auth_epoch_;
+            std::cout << "cluster: configEpoch set to " << myself_->config_epoch << " after successful failover\n";
+        }
+        failover_replace_master();
+    } else {
+        cant_failover("waiting for votes, but majority still not reached");
+    }
+}
+
+void Cluster::request_failover_auth() {
+    Message m = header(MsgType::kFailoverAuthRequest);
+    // Manual failover: the master isn't FAIL, so ask the masters to vote
+    // anyway (the master itself agreed, or FORCE overrode it).
+    if (mf_end_) {
+        m.mflags |= cluster::kMsgForceAck;
+    }
+    broadcast(m);
+}
+
+// Redis's clusterFailoverReplaceYourMaster(): take our master's slots.
+// Our config epoch is now the highest in the cluster, so the claim wins
+// on every node as our PONGs spread, and the old master (when it's back)
+// and its other replicas turn into our replicas.
+void Cluster::failover_replace_master() {
+    Node* old_master = lookup(myself_->master_id);
+    if (myself_->is(kMaster) || old_master == nullptr) {
+        return;
+    }
+    set_node_as_master(myself_);
+    replication_.replicaof_no_one();
+    for (int slot = 0; slot < kSlots; ++slot) {
+        if (owner_[slot] == old_master) {
+            set_slot(slot, myself_);
+        }
+    }
+    std::cout << "cluster: failover done: took over " << myself_->slots.count() << " slots from " << old_master->id
+              << " with config epoch " << myself_->config_epoch << "\n";
+    // Straight to disk, and straight to everyone: the new config must
+    // survive a crash, and the sooner the others see it the shorter the
+    // outage.
+    update_state();
+    if (!save_config()) {
+        std::cerr << "cluster: can't save " << options_.config_file << ": " << std::strerror(errno) << "\n";
+    }
+    broadcast_pong();
+    reset_manual_failover();
+    cant_failover("");
+}
+
+// --- failover, master side ------------------------------------------------------------
+
+// Redis's clusterSendFailoverAuthIfNeeded(): grant `requester` our vote,
+// unless one of the safety rules says no. Each refusal is logged: an
+// election that doesn't converge is otherwise very hard to diagnose.
+void Cluster::send_failover_auth_if_needed(Node* requester, const Message& request) {
+    if (myself_->is(kReplica) || myself_->slots.none()) {
+        return;  // only masters serving slots vote
+    }
+    auto t = now();
+    auto refuse = [&requester](const std::string& why) {
+        std::cout << "cluster: failover auth denied to " << requester->id << ": " << why << "\n";
+    };
+    // process_packet() already raised our current epoch to the request's
+    // if it was higher, so a lower one is an old election.
+    if (request.current_epoch < current_epoch_) {
+        return refuse("its current epoch " + std::to_string(request.current_epoch) + " is older than ours " +
+                      std::to_string(current_epoch_));
+    }
+    if (last_vote_epoch_ == current_epoch_) {
+        return refuse("already voted for epoch " + std::to_string(current_epoch_));
+    }
+    Node* master = requester->is(kReplica) ? lookup(requester->master_id) : nullptr;
+    bool force = (request.mflags & cluster::kMsgForceAck) != 0;
+    if (master == nullptr) {
+        return refuse(requester->is(kMaster) ? "it is a master" : "I don't know its master");
+    }
+    if (!master->is(kFail) && !force) {
+        return refuse("its master is not failing");
+    }
+    // One vote per master per 2 node timeouts: once we've backed one of its
+    // replicas, give that one time to win before backing another.
+    if (master->voted_time != SteadyTime{} && t - master->voted_time < options_.node_timeout * 2) {
+        return refuse("voted for a replica of " + master->id + " less than " +
+                      std::to_string(options_.node_timeout.count() * 2) + "ms ago");
+    }
+    // The replica must not claim slots under an older config than their
+    // current owners': that would mean it's replacing a master whose slots
+    // have since moved on (it's stale; the newer owner wins).
+    for (int slot = 0; slot < kSlots; ++slot) {
+        if (request.slots[slot] && owner_[slot] != nullptr && owner_[slot]->config_epoch > request.config_epoch) {
+            return refuse("slot " + std::to_string(slot) + " has a newer config epoch " +
+                          std::to_string(owner_[slot]->config_epoch) + " than the request's " +
+                          std::to_string(request.config_epoch));
+        }
+    }
+
+    last_vote_epoch_ = current_epoch_;
+    master->voted_time = t;
+    // Durable before it's sent: after a crash and restart we must still
+    // know we voted in this epoch, or we could vote again for a rival.
+    if (!save_config()) {
+        last_vote_epoch_ = 0;
+        std::cerr << "cluster: can't save " << options_.config_file << " before voting: " << std::strerror(errno)
+                  << "\n";
+        return;
+    }
+    if (requester->link == nullptr || requester->link->connecting) {
+        return refuse("no link to it to send the vote on");
+    }
+    send(requester->link, header(MsgType::kFailoverAuthAck));
+    std::cout << "cluster: failover auth granted to " << requester->id << " for epoch " << current_epoch_ << "\n";
+}
+
+// --- manual failover ------------------------------------------------------------------
+
+// Replica: the master's final offset is known; once we've applied that
+// much of its stream we hold every write it ever acknowledged, and the
+// election can start.
+void Cluster::handle_manual_failover() {
+    todo_handle_manual_failover_ = false;
+    if (!mf_end_ || mf_can_start_ || !mf_master_offset_) {
+        return;
+    }
+    if (*mf_master_offset_ == replication_.offset()) {
+        mf_can_start_ = true;
+        std::cout << "cluster: all of the master's replication stream processed, manual failover can start\n";
+        todo_handle_failover_ = true;
+    }
+}
+
+void Cluster::manual_failover_check_timeout() {
+    if (mf_end_ && now() > *mf_end_) {
+        std::cout << "cluster: manual failover timed out\n";
+        reset_manual_failover();
+    }
+}
+
+void Cluster::reset_manual_failover() {
+    if (writes_paused_) {
+        pause_writes(false);
+    }
+    mf_end_.reset();
+    mf_replica_ = nullptr;
+    mf_master_offset_.reset();
+    mf_can_start_ = false;
+}
+
+// Master side of a manual failover: hold client writes, and keep keys from
+// expiring (passive expiry) and the replication PINGs off the stream, so
+// our offset stops moving and the replica can reach it.
+void Cluster::pause_writes(bool paused) {
+    writes_paused_ = paused;
+    if (host_ != nullptr) {
+        host_->set_writes_paused(paused);
+    }
+    store_.set_passive_expiry(paused || replication_.is_replica());
+    replication_.set_stream_paused(paused);
+}
+
 void Cluster::before_sleep() {
+    // Reacting here rather than at the next cron tick shaves up to 100ms
+    // off each step of an election.
+    if (todo_handle_manual_failover_ && host_ != nullptr) {
+        handle_manual_failover();
+    }
+    if (todo_handle_failover_ && host_ != nullptr) {
+        handle_replica_failover();
+    }
     if (todo_update_state_) {
         update_state();
     }
@@ -972,6 +1556,8 @@ std::string Cluster::describe_nodes(bool for_config) const {
         if (n->is(kMyself)) flags.push_back("myself");
         if (n->is(kMaster)) flags.push_back("master");
         if (n->is(kReplica)) flags.push_back("slave");
+        if (n->is(kPFail)) flags.push_back("fail?");
+        if (n->is(kFail)) flags.push_back("fail");
         if (n->is(kHandshake)) flags.push_back("handshake");
         if (n->is(kNoAddr)) flags.push_back("noaddr");
         std::string flag_str;
@@ -1001,7 +1587,7 @@ std::string Cluster::describe_nodes(bool for_config) const {
         s << "\n";
     }
     if (for_config) {
-        s << "vars currentEpoch " << current_epoch_ << " lastVoteEpoch 0\n";
+        s << "vars currentEpoch " << current_epoch_ << " lastVoteEpoch " << last_vote_epoch_ << "\n";
     }
     return s.str();
 }
@@ -1078,6 +1664,10 @@ bool Cluster::parse_config(const std::string& text, std::string& error) {
                     error = "bad currentEpoch";
                     return false;
                 }
+                if (f[i] == "lastVoteEpoch" && !parse_num(f[i + 1], last_vote_epoch_)) {
+                    error = "bad lastVoteEpoch";
+                    return false;
+                }
             }
             continue;
         }
@@ -1095,6 +1685,8 @@ bool Cluster::parse_config(const std::string& text, std::string& error) {
             if (fl == "master") bits |= kMaster;
             if (fl == "slave") bits |= kReplica;
             if (fl == "noaddr") bits |= kNoAddr;
+            if (fl == "fail?") bits |= kPFail;
+            if (fl == "fail") bits |= kFail;
         }
         // ip:port@cport
         size_t colon = f[1].rfind(':');
@@ -1107,6 +1699,9 @@ bool Cluster::parse_config(const std::string& text, std::string& error) {
             return false;
         }
         Node* n = create_node(f[0], bits);
+        if (n->is(kFail)) {
+            n->fail_time = now();  // a FAIL we knew of before the restart stands
+        }
         n->ip = f[1].substr(0, colon);
         n->port = port;
         n->cport = cport;
@@ -1170,18 +1765,25 @@ bool Cluster::parse_config(const std::string& text, std::string& error) {
 // --- CLUSTER command ----------------------------------------------------------------
 
 std::string Cluster::info() const {
-    size_t assigned = std::count_if(owner_.begin(), owner_.end(), [](const Node* n) { return n != nullptr; });
-    size_t size = std::count_if(nodes_.begin(), nodes_.end(),
-                                [](const auto& e) { return e.second->is(kMaster) && e.second->slots.any(); });
+    size_t assigned = 0;
+    size_t pfail = 0;
+    size_t fail = 0;
+    for (const Node* n : owner_) {
+        if (n != nullptr) {
+            ++assigned;
+            pfail += n->is(kPFail) ? 1 : 0;
+            fail += n->is(kFail) ? 1 : 0;
+        }
+    }
     const Node* master = master_of(myself_);
     std::ostringstream s;
     s << "cluster_state:" << (state_ok_ ? "ok" : "fail") << "\r\n";
     s << "cluster_slots_assigned:" << assigned << "\r\n";
-    s << "cluster_slots_ok:" << assigned << "\r\n";
-    s << "cluster_slots_pfail:0\r\n";
-    s << "cluster_slots_fail:0\r\n";
+    s << "cluster_slots_ok:" << assigned - pfail - fail << "\r\n";
+    s << "cluster_slots_pfail:" << pfail << "\r\n";
+    s << "cluster_slots_fail:" << fail << "\r\n";
     s << "cluster_known_nodes:" << nodes_.size() << "\r\n";
-    s << "cluster_size:" << size << "\r\n";
+    s << "cluster_size:" << cluster_size() << "\r\n";
     s << "cluster_current_epoch:" << current_epoch_ << "\r\n";
     s << "cluster_my_epoch:" << (master != nullptr ? master->config_epoch : 0) << "\r\n";
     s << "cluster_stats_messages_sent:" << messages_sent_ << "\r\n";
@@ -1239,6 +1841,14 @@ void Cluster::command(const Args& argv, std::string& out) {
     } else if (sub == "FORGET") {
         if (argc != 3) return wrong_args();
         cmd_forget(argv, out);
+    } else if (sub == "FAILOVER") {
+        if (argc > 3) return wrong_args();
+        cmd_failover(argv, out);
+    } else if (sub == "COUNT-FAILURE-REPORTS") {
+        if (argc != 3) return wrong_args();
+        Node* n = lookup(argv[2]);
+        if (n == nullptr) return reply::error(out, "ERR Unknown node " + argv[2]);
+        reply::integer(out, static_cast<int64_t>(count_fail_reports(n)));
     } else if (sub == "SET-CONFIG-EPOCH") {
         uint64_t epoch;
         if (argc != 3) return wrong_args();
@@ -1434,6 +2044,55 @@ void Cluster::cmd_forget(const Args& argv, std::string& out) {
     }
     blacklist_[n->id] = now() + kBlacklistTtl;
     del_node(n);
+    reply::simple_string(out, "OK");
+}
+
+// FAILOVER [FORCE | TAKEOVER] — run on a replica to promote it now:
+//  - (default) coordinated with a live master: it pauses writes, we catch
+//    up to its final offset, then win a normal election. No writes lost.
+//  - FORCE: the master is unreachable; skip the catch-up, still hold an
+//    election (masters vote without the master being FAIL).
+//  - TAKEOVER: no election either; just take a fresh epoch and the slots.
+//    For when a majority of masters is gone and no vote could succeed.
+void Cluster::cmd_failover(const Args& argv, std::string& out) {
+    bool force = false;
+    bool takeover = false;
+    if (argv.size() == 3) {
+        std::string opt = to_upper(argv[2]);
+        if (opt == "FORCE") {
+            force = true;
+        } else if (opt == "TAKEOVER") {
+            takeover = true;
+        } else {
+            return reply::error(out, "ERR syntax error");
+        }
+    }
+    if (myself_->is(kMaster)) {
+        return reply::error(out, "ERR You should send CLUSTER FAILOVER to a replica");
+    }
+    Node* master = lookup(myself_->master_id);
+    if (master == nullptr) {
+        return reply::error(out, "ERR I'm a replica but my master is unknown to me");
+    }
+    if (!force && !takeover && (master->is(kFail) || master->link == nullptr || master->link->connecting)) {
+        return reply::error(out, "ERR Master is down or failed, please use CLUSTER FAILOVER FORCE");
+    }
+    reset_manual_failover();
+    mf_end_ = now() + kManualFailoverTimeout;
+    if (takeover) {
+        std::cout << "cluster: taking over the master (CLUSTER FAILOVER TAKEOVER)\n";
+        bump_epoch_without_consensus();
+        failover_replace_master();
+    } else if (force) {
+        std::cout << "cluster: forced failover requested (CLUSTER FAILOVER FORCE)\n";
+        mf_can_start_ = true;
+        failover_auth_time_.reset();  // start a fresh election now
+        todo_handle_failover_ = true;
+    } else {
+        std::cout << "cluster: manual failover requested; asking the master to pause writes\n";
+        failover_auth_time_.reset();
+        send(master->link, header(MsgType::kMfStart));
+    }
     reply::simple_string(out, "OK");
 }
 

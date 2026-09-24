@@ -102,6 +102,7 @@ void Replication::replicaof(const std::string& host, uint16_t port) {
     master_port_ = port;
     link_state_ = LinkState::kConnect;
     next_connect_ = now();
+    link_down_since_ = now();
     // From now on the master decides when keys expire.
     store_.set_passive_expiry(true);
     // Our replicas were following us as a master. They reconnect, and since
@@ -668,16 +669,25 @@ void Replication::client_closed(Client& c) {
     if (&c == master_) {
         std::cerr << "lost the connection to master " << master_host_ << ":" << master_port_ << "\n";
         master_ = nullptr;
+        link_down_since_ = now();
         link_state_ = LinkState::kConnect;
         next_connect_ = now();
     }
+}
+
+Replication::SteadyTime Replication::master_last_contact() const {
+    if (link_state_ == LinkState::kConnected && master_ != nullptr) {
+        return master_->last_interaction;
+    }
+    return link_down_since_;
 }
 
 void Replication::before_sleep() {
     for (Client* c : std::exchange(to_resume_, {})) {
         host_->process_buffered(*c);
     }
-    if (get_ack_pending_) {
+    // While paused the GETACK waits: it would move the offset.
+    if (get_ack_pending_ && !stream_paused_) {
         get_ack_pending_ = false;
         // Goes through the stream like any command, so a replica's ACK
         // covers every write before it.
@@ -724,7 +734,7 @@ void Replication::cron() {
         send_ack();
     }
     // A replica forwards its master's PINGs; only a real master makes them.
-    if (!is_replica() && !replicas_.empty() && t - last_ping_ >= options_.ping_period) {
+    if (!is_replica() && !stream_paused_ && !replicas_.empty() && t - last_ping_ >= options_.ping_period) {
         last_ping_ = t;
         propagate({"PING"});
     }

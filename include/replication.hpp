@@ -60,6 +60,17 @@ public:
     uint16_t master_port() const { return master_port_; }
     uint64_t offset() const { return backlog_.offset(); }
     const std::string& replid() const { return replid_; }
+    std::chrono::seconds ping_period() const { return options_.ping_period; }
+
+    // Replica: when we last heard from our master: the last read on a live
+    // link, or when the link went down. A cluster replica uses it to judge
+    // whether its data is fresh enough to take over from a failed master.
+    SteadyTime master_last_contact() const;
+
+    // Master, during a manual failover: stop adding our own traffic (PINGs,
+    // WAIT's GETACK) to the stream, so its offset holds still once client
+    // writes are paused and the replica can catch up to exactly that offset.
+    void set_stream_paused(bool paused) { stream_paused_ = paused; }
 
     // REPLICAOF host port / REPLICAOF NO ONE.
     void replicaof(const std::string& host, uint16_t port);
@@ -148,6 +159,7 @@ private:
     // buffered commands run at the next before_sleep().
     std::vector<Client*> to_resume_;
     bool get_ack_pending_ = false;
+    bool stream_paused_ = false;
     SteadyTime last_ping_{};
     SteadyTime last_second_tick_{};
     uint64_t sync_full_ = 0;
@@ -161,6 +173,7 @@ private:
     int link_fd_ = -1;
     std::string link_buf_;
     SteadyTime link_last_io_{};
+    SteadyTime link_down_since_{};  // replica: when the master link was last lost (or first wanted)
     int handshake_replies_ = 0;
     std::string transfer_replid_;
     uint64_t transfer_offset_ = 0;

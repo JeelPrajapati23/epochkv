@@ -15,9 +15,12 @@
 // fixed binary struct instead; RESP costs a few more bytes per message but
 // is binary-safe (the slot bitmap is sent raw) and readable in a packet dump.
 //
-//   type sender port cport role master current-epoch config-epoch slots
-//   then, for PING/PONG/MEET: count, and per gossiped node: id ip port cport role
+//   type sender port cport role master current-epoch config-epoch
+//        repl-offset mflags slots
+//   then, for PING/PONG/MEET: count, and per gossiped node: id ip port cport flags
 //   or, for UPDATE:           node-id config-epoch slots
+//   or, for FAIL:             node-id
+//   (FAILOVER_AUTH_REQUEST, FAILOVER_AUTH_ACK and MFSTART are just the header)
 namespace cluster {
 
 using SlotBitmap = std::bitset<kSlots>;
@@ -29,15 +32,29 @@ enum class MsgType {
     kPong,  // reply to PING/MEET; also broadcast unprompted after a config change
     kMeet,  // PING that asks the receiver to add us even though it doesn't know us
     kUpdate,  // "your view of node X is stale: here is its newer slot config"
+    kFail,    // "a majority of masters agree node X is down": flag it FAIL now
+    kFailoverAuthRequest,  // a replica asks the masters to vote for its promotion
+    kFailoverAuthAck,      // a master's vote
+    kMfStart,              // a replica asks its master to start a manual failover
 };
 
-// What the sender knows about some other node.
+// Message flags (Redis's mflags).
+enum MsgFlag : unsigned {
+    kMsgPaused = 1u << 0,    // sender is a master with writes paused for a manual failover
+    kMsgForceAck = 1u << 1,  // vote even though the master isn't FAIL (manual failover)
+};
+
+// What the sender knows about some other node. pfail/fail are the sender's
+// opinion of the node's health: coming from a master, a failure report,
+// the raw material of failure detection.
 struct GossipEntry {
     std::string id;
     std::string ip;
     uint16_t port = 0;
     uint16_t cport = 0;
     bool replica = false;
+    bool pfail = false;
+    bool fail = false;
 };
 
 struct Message {
@@ -52,6 +69,11 @@ struct Message {
     // replica (as in Redis: a replica advertises the slots it would take
     // over in a failover).
     uint64_t config_epoch = 0;
+    // Replication offset: a master's stream position, or how much of its
+    // master's stream a replica has applied. Replicas compare these to rank
+    // themselves in an election; a manual failover waits on the master's.
+    uint64_t repl_offset = 0;
+    unsigned mflags = 0;  // MsgFlag bits
     SlotBitmap slots;
 
     std::vector<GossipEntry> gossip;  // PING/PONG/MEET
@@ -59,6 +81,8 @@ struct Message {
     std::string update_id;  // UPDATE: the node whose config this is
     uint64_t update_epoch = 0;
     SlotBitmap update_slots;
+
+    std::string fail_id;  // FAIL: the node now considered down
 };
 
 bool valid_node_id(const std::string& id);

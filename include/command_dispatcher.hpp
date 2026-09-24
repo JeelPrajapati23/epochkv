@@ -44,6 +44,9 @@ public:
     // callers (AOF replay, tests), where the replication commands error.
     void dispatch(const Args& argv, std::string& out, Client* client = nullptr);
 
+    // True if `argv` names a command that may modify the dataset.
+    bool is_write(const Args& argv) const;
+
 private:
     using Handler = void (CommandDispatcher::*)(const Args&, std::string&);
 

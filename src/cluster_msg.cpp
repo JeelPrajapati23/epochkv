@@ -7,9 +7,14 @@
 namespace cluster {
 namespace {
 
-constexpr size_t kHeaderFields = 9;
+constexpr size_t kHeaderFields = 11;
 constexpr size_t kGossipFields = 5;
 constexpr size_t kSlotBytes = kSlots / 8;
+
+constexpr MsgType kAllTypes[] = {
+    MsgType::kPing, MsgType::kPong,  MsgType::kMeet, MsgType::kUpdate, MsgType::kFail, MsgType::kFailoverAuthRequest,
+    MsgType::kFailoverAuthAck, MsgType::kMfStart,
+};
 
 const char* type_name(MsgType t) {
     switch (t) {
@@ -21,18 +26,31 @@ const char* type_name(MsgType t) {
             return "MEET";
         case MsgType::kUpdate:
             return "UPDATE";
+        case MsgType::kFail:
+            return "FAIL";
+        case MsgType::kFailoverAuthRequest:
+            return "FAILOVER_AUTH_REQUEST";
+        case MsgType::kFailoverAuthAck:
+            return "FAILOVER_AUTH_ACK";
+        case MsgType::kMfStart:
+            return "MFSTART";
     }
     return "?";
 }
 
 bool parse_type(const std::string& s, MsgType& t) {
-    for (MsgType candidate : {MsgType::kPing, MsgType::kPong, MsgType::kMeet, MsgType::kUpdate}) {
+    for (MsgType candidate : kAllTypes) {
         if (s == type_name(candidate)) {
             t = candidate;
             return true;
         }
     }
     return false;
+}
+
+// Election and manual-failover messages carry nothing beyond the header.
+bool header_only(MsgType t) {
+    return t == MsgType::kFailoverAuthRequest || t == MsgType::kFailoverAuthAck || t == MsgType::kMfStart;
 }
 
 template <typename T>
@@ -50,6 +68,38 @@ bool parse_role(const std::string& s, bool& replica) {
         return false;
     }
     replica = s == "slave";
+    return true;
+}
+
+// "master", "slave,fail?", "master,fail": the role, then the sender's
+// opinion of the node's health, in the words CLUSTER NODES uses.
+std::string gossip_flags(const GossipEntry& g) {
+    std::string flags = g.replica ? "slave" : "master";
+    if (g.fail) {
+        flags += ",fail";
+    } else if (g.pfail) {
+        flags += ",fail?";
+    }
+    return flags;
+}
+
+bool parse_gossip_flags(const std::string& s, GossipEntry& g) {
+    size_t comma = s.find(',');
+    if (!parse_role(s.substr(0, comma), g.replica)) {
+        return false;
+    }
+    while (comma != std::string::npos) {
+        size_t next = s.find(',', comma + 1);
+        std::string flag = s.substr(comma + 1, next == std::string::npos ? std::string::npos : next - comma - 1);
+        if (flag == "fail?") {
+            g.pfail = true;
+        } else if (flag == "fail") {
+            g.fail = true;
+        } else {
+            return false;
+        }
+        comma = next;
+    }
     return true;
 }
 
@@ -100,15 +150,18 @@ void encode(const Message& msg, std::string& out) {
         msg.master_id.empty() ? "-" : msg.master_id,
         std::to_string(msg.current_epoch),
         std::to_string(msg.config_epoch),
+        std::to_string(msg.repl_offset),
+        std::to_string(msg.mflags),
         slots_to_bytes(msg.slots),
     };
     if (msg.type == MsgType::kUpdate) {
         argv.insert(argv.end(), {msg.update_id, std::to_string(msg.update_epoch), slots_to_bytes(msg.update_slots)});
-    } else {
+    } else if (msg.type == MsgType::kFail) {
+        argv.push_back(msg.fail_id);
+    } else if (!header_only(msg.type)) {
         argv.push_back(std::to_string(msg.gossip.size()));
         for (const GossipEntry& g : msg.gossip) {
-            argv.insert(argv.end(), {g.id, g.ip, std::to_string(g.port), std::to_string(g.cport),
-                                     g.replica ? "slave" : "master"});
+            argv.insert(argv.end(), {g.id, g.ip, std::to_string(g.port), std::to_string(g.cport), gossip_flags(g)});
         }
     }
     reply::command(out, argv);
@@ -122,7 +175,8 @@ bool decode(const std::vector<std::string>& argv, Message& msg) {
     msg.sender = argv[1];
     if (!valid_node_id(msg.sender) || !parse_port(argv[2], msg.port) || !parse_port(argv[3], msg.cport) ||
         !parse_role(argv[4], msg.replica) || !parse_uint(argv[6], msg.current_epoch) ||
-        !parse_uint(argv[7], msg.config_epoch) || !slots_from_bytes(argv[8], msg.slots)) {
+        !parse_uint(argv[7], msg.config_epoch) || !parse_uint(argv[8], msg.repl_offset) ||
+        !parse_uint(argv[9], msg.mflags) || !slots_from_bytes(argv[10], msg.slots)) {
         return false;
     }
     if (argv[5] != "-") {
@@ -131,30 +185,41 @@ bool decode(const std::vector<std::string>& argv, Message& msg) {
         }
         msg.master_id = argv[5];
     }
+    const std::string* body = argv.data() + kHeaderFields;
+    size_t body_size = argv.size() - kHeaderFields;
 
     if (msg.type == MsgType::kUpdate) {
-        if (argv.size() != kHeaderFields + 3 || !valid_node_id(argv[9]) || !parse_uint(argv[10], msg.update_epoch) ||
-            !slots_from_bytes(argv[11], msg.update_slots)) {
+        if (body_size != 3 || !valid_node_id(body[0]) || !parse_uint(body[1], msg.update_epoch) ||
+            !slots_from_bytes(body[2], msg.update_slots)) {
             return false;
         }
-        msg.update_id = argv[9];
+        msg.update_id = body[0];
         return true;
+    }
+    if (msg.type == MsgType::kFail) {
+        if (body_size != 1 || !valid_node_id(body[0])) {
+            return false;
+        }
+        msg.fail_id = body[0];
+        return true;
+    }
+    if (header_only(msg.type)) {
+        return body_size == 0;
     }
 
     size_t count;
     // count is checked against the array size first, so a huge count can't
     // overflow the multiplication.
-    if (argv.size() < kHeaderFields + 1 || !parse_uint(argv[kHeaderFields], count) || count > argv.size() ||
-        argv.size() != kHeaderFields + 1 + count * kGossipFields) {
+    if (body_size < 1 || !parse_uint(body[0], count) || count > body_size || body_size != 1 + count * kGossipFields) {
         return false;
     }
     for (size_t i = 0; i < count; ++i) {
-        const std::string* f = &argv[kHeaderFields + 1 + i * kGossipFields];
+        const std::string* f = body + 1 + i * kGossipFields;
         GossipEntry g;
         g.id = f[0];
         g.ip = f[1];
         if (!valid_node_id(g.id) || !parse_port(f[2], g.port) || !parse_port(f[3], g.cport) ||
-            !parse_role(f[4], g.replica)) {
+            !parse_gossip_flags(f[4], g)) {
             return false;
         }
         msg.gossip.push_back(std::move(g));

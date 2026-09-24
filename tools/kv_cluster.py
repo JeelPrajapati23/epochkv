@@ -237,57 +237,137 @@ def reshard(src_addr, dst_addr, count=None, slots=None, batch=100):
         dst.close()
 
 
+def crc16(data):
+    """CRC16/XMODEM, the checksum Redis Cluster hashes keys with."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else crc << 1
+            crc &= 0xFFFF
+    return crc
+
+
+def key_slot(key):
+    """Hash slot of a key, honoring {hash tags}."""
+    key = key if isinstance(key, bytes) else str(key).encode()
+    start = key.find(b"{")
+    if start != -1:
+        end = key.find(b"}", start + 1)
+        if end > start + 1:
+            key = key[start + 1:end]
+    return crc16(key) % SLOTS
+
+
 class ClusterClient:
     """Routes each command to the node owning its key, following MOVED
-    (refresh the slot map) and ASK (retry once at the target with ASKING)."""
+    (refresh the slot map) and ASK (retry once at the target with ASKING).
 
-    def __init__(self, seed, max_redirects=16):
+    Also rides out failovers: if a node stops answering, or the cluster
+    reports CLUSTERDOWN while it reconfigures, it reloads the slot map from
+    any node it knows and retries, for up to `retry_timeout` seconds."""
+
+    def __init__(self, seed, max_redirects=16, retry_timeout=30):
         self.seed = seed
+        self.known = [seed]
         self.max_redirects = max_redirects
+        self.retry_timeout = retry_timeout
         self.conns = {}
         self.slots = {}
         self.redirects = {"MOVED": 0, "ASK": 0, "TRYAGAIN": 0}
+        self.retries = {"connection": 0, "CLUSTERDOWN": 0}
         self.refresh()
 
     def conn(self, addr):
         if addr not in self.conns:
-            self.conns[addr] = Conn(*addr)
+            self.conns[addr] = Conn(*addr, timeout=5)
         return self.conns[addr]
 
+    def drop(self, addr):
+        c = self.conns.pop(addr, None)
+        if c is not None:
+            c.close()
+
     def refresh(self):
-        for start, end, master, *_ in self.conn(self.seed).call("CLUSTER", "SLOTS"):
-            addr = (master[0].decode(), master[1])
-            for s in range(start, end + 1):
-                self.slots[s] = addr
+        """Reloads the slot map from the first known node that answers."""
+        for addr in list(self.known):
+            try:
+                ranges = self.conn(addr).call("CLUSTER", "SLOTS")
+            except (OSError, ReplyError):
+                self.drop(addr)
+                continue
+            self.slots = {}
+            for start, end, *nodes in ranges:
+                for node in nodes:
+                    naddr = (node[0].decode(), node[1])
+                    if naddr not in self.known:
+                        self.known.append(naddr)
+                master = (nodes[0][0].decode(), nodes[0][1])
+                for s in range(start, end + 1):
+                    self.slots[s] = master
+            return
+        raise ConnectionError("no known cluster node answers")
 
     def keyslot(self, key):
-        return self.conn(self.seed).call("CLUSTER", "KEYSLOT", key)
+        return key_slot(key)
 
     def call(self, *args, key=None):
         key = key if key is not None else args[1]
-        addr = self.slots.get(self.keyslot(key), self.seed)
+        slot = self.keyslot(key)
+        addr = self.slots.get(slot, self.seed)
         asking = False
-        for _ in range(self.max_redirects):
-            c = self.conn(addr)
-            if asking:
-                c.call("ASKING")
-            r = c.call_raw(*args)
+        redirects = 0
+        deadline = time.time() + self.retry_timeout
+        while True:
+            try:
+                c = self.conn(addr)
+                if asking:
+                    c.call("ASKING")
+                r = c.call_raw(*args)
+            except OSError:
+                # The node died (or is dying). Its replica may be taking
+                # over: wait a moment, then ask the survivors who owns the
+                # slot now.
+                self.drop(addr)
+                self.retries["connection"] += 1
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.1)
+                try:
+                    self.refresh()
+                except ConnectionError:
+                    pass
+                addr, asking = self.slots.get(slot, self.seed), False
+                continue
             if not isinstance(r, ReplyError):
                 return r
             kind, *rest = str(r).split()
             if kind in ("MOVED", "ASK"):
+                redirects += 1
+                if redirects > self.max_redirects:
+                    raise ReplyError("too many redirects for %r" % (args,))
                 self.redirects[kind] += 1
                 slot, target = int(rest[0]), parse_addr(rest[1])
                 addr, asking = target, kind == "ASK"
+                if target not in self.known:
+                    self.known.append(target)
                 if kind == "MOVED":
                     self.slots[slot] = target
             elif kind == "TRYAGAIN":
                 self.redirects[kind] += 1
                 asking = False
                 time.sleep(0.01)
+            elif kind == "CLUSTERDOWN" and time.time() < deadline:
+                self.retries["CLUSTERDOWN"] += 1
+                asking = False
+                time.sleep(0.1)
+                try:
+                    self.refresh()
+                except ConnectionError:
+                    pass
+                addr = self.slots.get(slot, self.seed)
             else:
                 raise r
-        raise ReplyError("too many redirects for %r" % (args,))
 
     def close(self):
         for c in self.conns.values():

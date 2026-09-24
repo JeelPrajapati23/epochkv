@@ -124,6 +124,14 @@ bool CommandDispatcher::arity_ok(int arity, size_t argc) {
     return argc >= static_cast<size_t>(-arity);
 }
 
+bool CommandDispatcher::is_write(const Args& argv) const {
+    if (argv.empty()) {
+        return false;
+    }
+    auto it = table_.find(to_upper(argv[0]));
+    return it != table_.end() && (it->second.flags & kWrite) != 0;
+}
+
 void CommandDispatcher::dispatch(const Args& argv, std::string& out, Client* client) {
     if (argv.empty()) {
         return;

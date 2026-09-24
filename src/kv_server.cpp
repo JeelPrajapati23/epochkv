@@ -39,7 +39,8 @@ void usage(const char* prog) {
                  "       [--auto-aof-rewrite-percentage PCT] [--auto-aof-rewrite-min-size BYTES]\n"
                  "       [--replicaof HOST PORT] [--repl-backlog-size BYTES] [--repl-timeout SECONDS]\n"
                  "       [--cluster-enabled yes|no] [--cluster-config-file NAME] [--cluster-port PORT]\n"
-                 "       [--cluster-node-timeout MS] [--cluster-require-full-coverage yes|no]\n";
+                 "       [--cluster-node-timeout MS] [--cluster-require-full-coverage yes|no]\n"
+                 "       [--cluster-replica-validity-factor N] [--cluster-replica-no-failover yes|no]\n";
 }
 
 // "3600 1 300 100" -> {{3600, 1}, {300, 100}}; "" -> no save points.
@@ -215,13 +216,26 @@ int main(int argc, char** argv) {
                 return 1;
             }
             repl_options.timeout = std::chrono::seconds(value);
-        } else if ((arg == "--cluster-enabled" || arg == "--cluster-require-full-coverage") && has_value) {
+        } else if ((arg == "--cluster-enabled" || arg == "--cluster-require-full-coverage" ||
+                    arg == "--cluster-replica-no-failover") &&
+                   has_value) {
             std::string value = argv[++i];
             if (value != "yes" && value != "no") {
                 std::cerr << "invalid " << arg.substr(2) << ": " << value << "\n";
                 return 1;
             }
-            (arg == "--cluster-enabled" ? cluster_enabled : cluster_options.require_full_coverage) = value == "yes";
+            bool& target = arg == "--cluster-enabled"                 ? cluster_enabled
+                           : arg == "--cluster-require-full-coverage" ? cluster_options.require_full_coverage
+                                                                      : cluster_options.replica_no_failover;
+            target = value == "yes";
+        } else if (arg == "--cluster-replica-validity-factor" && has_value) {
+            char* end = nullptr;
+            long value = std::strtol(argv[++i], &end, 10);
+            if (*end != '\0' || value < 0 || value > 1000000) {
+                std::cerr << "invalid cluster-replica-validity-factor: " << argv[i] << "\n";
+                return 1;
+            }
+            cluster_options.replica_validity_factor = static_cast<int>(value);
         } else if (arg == "--cluster-config-file" && has_value) {
             cluster_config_file = argv[++i];
             if (cluster_config_file.find('/') != std::string::npos) {

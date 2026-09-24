@@ -56,10 +56,12 @@ public:
     bool watch(int fd, bool want_write, std::function<void()> on_ready) override;
     void unwatch(int fd) override;
     Client& adopt_master(int fd, const std::string& pending) override;
+    void set_writes_paused(bool paused) override;
 
 private:
     int cron_timeout_ms() const;
     void run_cron_if_due();
+    void resume_held_clients();
 
     Client& add_client(int fd);
     void accept_clients();
@@ -94,4 +96,8 @@ private:
     std::unordered_map<int, std::function<void()>> watchers_;
     std::vector<int> pending_writes_;  // clients with fresh replies to send this iteration
     std::vector<int> pending_close_;
+
+    bool writes_paused_ = false;
+    bool resume_held_ = false;       // unpaused: run held_clients_ before the next replies go out
+    std::vector<int> held_clients_;  // clients whose held_command waits for the pause to end
 };

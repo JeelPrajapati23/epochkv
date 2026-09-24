@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -41,7 +42,24 @@ class Store;
 // the slot over, bumping the target's config epoch so the new owner wins
 // in gossip.
 //
-// Not here yet: failure detection and automatic failover.
+// Failure detection: a node that hasn't answered a PING within the node
+// timeout is flagged PFAIL ("possibly failing") locally. Gossip carries
+// that opinion; a PFAIL flag gossiped by a master is a failure report.
+// Once a majority of the slot-serving masters report the same node, it is
+// flagged FAIL and a FAIL message makes every reachable node agree at once.
+//
+// Failover: replicas of a FAIL master hold an election. Each waits a short
+// delay (longer the further behind its replication offset is than its
+// siblings'), bumps the current epoch and asks every master for a vote. A
+// master votes at most once per epoch, persisting the vote before sending
+// it. The replica that collects a majority takes its master's slots under
+// that epoch, which is higher than any config epoch seen before, so its
+// claim wins everywhere through the normal slot-conflict rule; the old
+// master and its other replicas, once they see it, turn into its replicas.
+//
+// CLUSTER FAILOVER runs the same promotion by hand: by default after the
+// master pauses writes and the replica catches up (no data loss), with
+// FORCE without waiting for the master, with TAKEOVER without a vote.
 class Cluster {
 public:
     using Args = std::vector<std::string>;
@@ -61,6 +79,12 @@ public:
         // cluster-require-full-coverage). Otherwise a client could write a
         // key to a node, then find it "missing" once coverage changes.
         bool require_full_coverage = true;
+        // A replica whose last contact with its master is older than
+        // node_timeout * factor + the replication ping period won't start an
+        // election: its data is too stale to promote. 0 = always try.
+        int replica_validity_factor = 10;
+        // Never start an automatic failover (manual CLUSTER FAILOVER works).
+        bool replica_no_failover = false;
     };
 
     Cluster(Store& store, Replication& replication, Options options);
@@ -109,6 +133,8 @@ private:
         kHandshake = 1u << 3,  // met but not yet heard from: its ID is a placeholder
         kMeet = 1u << 4,       // send MEET rather than PING when connected
         kNoAddr = 1u << 5,     // address unknown; don't try to connect
+        kPFail = 1u << 6,      // no PONG within the node timeout: our own suspicion
+        kFail = 1u << 7,       // a majority of masters agree it's down
     };
 
     struct Link;
@@ -125,6 +151,12 @@ private:
         SteadyTime ctime{};
         SteadyTime ping_sent{};  // zero while no PING awaits its PONG
         SteadyTime pong_received{};
+        SteadyTime fail_time{};   // when it was flagged FAIL
+        SteadyTime voted_time{};  // masters: when we last voted for one of its replicas
+        uint64_t repl_offset = 0;  // as it last told us
+        // Masters that currently gossip this node as PFAIL/FAIL, and when
+        // they last did. Reports expire, so only recent opinions count.
+        std::unordered_map<std::string, SteadyTime> fail_reports;
         Link* link = nullptr;  // our outbound connection to it
 
         bool is(unsigned f) const { return (flags & f) != 0; }
@@ -159,6 +191,28 @@ private:
     void update_slots_config_with(Node* sender, uint64_t config_epoch, const SlotBitmap& slots);
     void handle_epoch_collision(Node* sender);
     void update_state();
+    int cluster_size() const;  // masters serving at least one slot
+    int needed_quorum() const { return cluster_size() / 2 + 1; }
+
+    // --- failure detection ---
+    void detect_failures();
+    size_t count_fail_reports(Node* n);  // drops expired reports first
+    void mark_node_as_failing_if_needed(Node* n);
+    void clear_node_failure_if_needed(Node* n);
+
+    // --- failover (replica side) ---
+    void handle_replica_failover();
+    int replica_rank() const;
+    void request_failover_auth();
+    void failover_replace_master();
+    void cant_failover(const std::string& reason);
+    // --- failover (master side) ---
+    void send_failover_auth_if_needed(Node* requester, const Message& request);
+    // --- manual failover ---
+    void handle_manual_failover();
+    void manual_failover_check_timeout();
+    void reset_manual_failover();
+    void pause_writes(bool paused);
     std::string random_id();
     void todo_save() { todo_save_ = true; }
 
@@ -176,8 +230,9 @@ private:
     void send_ping(Link* l, MsgType type);
     void broadcast_pong();
     void send_update(Link* l, const Node* n);
+    void broadcast(const Message& msg);
     void process_packet(Link* l, const Message& msg);
-    void process_gossip(const Message& msg);
+    void process_gossip(Node* sender, const Message& msg);
     void follow_master();
 
     // --- config file / output ---
@@ -192,6 +247,7 @@ private:
     void cmd_meet(const Args& argv, std::string& out);
     void cmd_replicate(const Args& argv, std::string& out);
     void cmd_forget(const Args& argv, std::string& out);
+    void cmd_failover(const Args& argv, std::string& out);
     void cmd_slots(std::string& out) const;
 
     Store& store_;
@@ -203,6 +259,10 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Node>> nodes_;
     Node* myself_ = nullptr;
     uint64_t current_epoch_ = 0;
+    // The epoch we last voted in, persisted in nodes.conf before the vote
+    // is sent: a master that restarts can't vote twice in one epoch, which
+    // is what keeps two replicas from both winning the same election.
+    uint64_t last_vote_epoch_ = 0;
     std::array<Node*, kSlots> owner_{};
     std::array<Node*, kSlots> migrating_to_{};
     std::array<Node*, kSlots> importing_from_{};
@@ -216,6 +276,29 @@ private:
     // Our own slots or epoch changed: PONG everyone now instead of waiting
     // for the next periodic PINGs to spread it.
     bool todo_broadcast_ = false;
+    bool todo_handle_failover_ = false;
+    bool todo_handle_manual_failover_ = false;
+
+    // Cluster state gating (see update_state()).
+    SteadyTime writable_after_{};       // a master stays "fail" briefly after startup
+    SteadyTime among_minority_time_{};  // last time we couldn't reach a majority of masters
+
+    // Our election, as a replica (Redis's failover_auth_*).
+    std::optional<SteadyTime> failover_auth_time_;  // when to ask for votes; unset = none scheduled
+    int failover_auth_rank_ = 0;
+    bool failover_auth_sent_ = false;
+    int failover_auth_count_ = 0;
+    uint64_t failover_auth_epoch_ = 0;
+    std::string cant_failover_reason_;  // last logged, so each reason is logged once
+
+    // Manual failover (Redis's mf_*). mf_end_ is set on both sides while one
+    // is in progress; the master also knows the replica and pauses writes,
+    // the replica learns the master's final offset and waits to reach it.
+    std::optional<SteadyTime> mf_end_;
+    Node* mf_replica_ = nullptr;
+    std::optional<uint64_t> mf_master_offset_;
+    bool mf_can_start_ = false;
+    bool writes_paused_ = false;
 
     int listen_fd_ = -1;
     std::vector<std::unique_ptr<Link>> links_;
