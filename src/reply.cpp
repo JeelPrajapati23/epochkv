@@ -32,6 +32,12 @@ void null_bulk(std::string& out) {
     out += "$-1\r\n";
 }
 
+void array_header(std::string& out, size_t n) {
+    out += '*';
+    out += std::to_string(n);
+    out += "\r\n";
+}
+
 void command(std::string& out, const std::vector<std::string>& argv) {
     out += '*';
     out += std::to_string(argv.size());

@@ -35,7 +35,8 @@ int64_t Store::system_now_ms() {
 
 Store::Store() : Store(Options{}) {}
 
-Store::Store(Options options) : options_(std::move(options)), rng_(std::random_device{}()) {}
+Store::Store(Options options)
+    : options_(std::move(options)), slots_(cluster::kSlots), rng_(std::random_device{}()) {}
 
 bool Store::expire_if_needed(const std::string& key) {
     if (expires_.size() == 0) {
@@ -93,7 +94,9 @@ void Store::set(const std::string& key, std::string value, bool keep_ttl) {
     }
     used_memory_ += entry_cost(key, value.size());
     lru_.push_front(key);
-    dict_.set(key, Entry{std::move(value), lru_.begin()});
+    auto& slot = slots_[cluster::key_hash_slot(key)];
+    slot.push_front(&lru_.front());
+    dict_.set(key, Entry{std::move(value), lru_.begin(), slot.begin()});
 }
 
 // Returns whether the key was live, but always removes it: under passive
@@ -192,7 +195,30 @@ void Store::clear() {
     dict_ = HashTable<Entry>();
     expires_ = HashTable<int64_t>();
     lru_.clear();
+    slots_.assign(cluster::kSlots, {});
     used_memory_ = 0;
+}
+
+std::vector<std::string> Store::keys_in_slot(int slot, size_t max) const {
+    std::vector<std::string> keys;
+    for (const std::string* key : slots_[slot]) {
+        if (keys.size() >= max) {
+            break;
+        }
+        keys.push_back(*key);
+    }
+    return keys;
+}
+
+size_t Store::delete_slot(int slot) {
+    size_t deleted = 0;
+    while (!slots_[slot].empty()) {
+        std::string victim = *slots_[slot].front();  // copy: remove() frees it
+        remove(victim);
+        ++deleted;
+        notify_deleted(victim);
+    }
+    return deleted;
 }
 
 bool Store::remove(const std::string& key) {
@@ -201,6 +227,7 @@ bool Store::remove(const std::string& key) {
         return false;
     }
     used_memory_ -= entry_cost(key, entry->value.size());
+    slots_[cluster::key_hash_slot(key)].erase(entry->slot_pos);
     lru_.erase(entry->lru_pos);
     dict_.del(key);
     clear_expire(key);

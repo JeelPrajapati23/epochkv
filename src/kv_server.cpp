@@ -3,12 +3,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "cluster.hpp"
 #include "command_dispatcher.hpp"
+#include "file_util.hpp"
 #include "persistence.hpp"
 #include "replication.hpp"
 #include "server.hpp"
@@ -34,7 +37,9 @@ void usage(const char* prog) {
                  "       [--dir DIR] [--dbfilename NAME] [--save \"SECONDS CHANGES ...\"]\n"
                  "       [--appendonly yes|no] [--appendfsync always|everysec|no]\n"
                  "       [--auto-aof-rewrite-percentage PCT] [--auto-aof-rewrite-min-size BYTES]\n"
-                 "       [--replicaof HOST PORT] [--repl-backlog-size BYTES] [--repl-timeout SECONDS]\n";
+                 "       [--replicaof HOST PORT] [--repl-backlog-size BYTES] [--repl-timeout SECONDS]\n"
+                 "       [--cluster-enabled yes|no] [--cluster-config-file NAME] [--cluster-port PORT]\n"
+                 "       [--cluster-node-timeout MS] [--cluster-require-full-coverage yes|no]\n";
 }
 
 // "3600 1 300 100" -> {{3600, 1}, {300, 100}}; "" -> no save points.
@@ -102,6 +107,10 @@ int main(int argc, char** argv) {
     Persistence::Options persistence_options;
     Replication::Options repl_options;
     std::optional<std::pair<std::string, uint16_t>> replicaof;
+    bool cluster_enabled = false;
+    Cluster::Options cluster_options;
+    std::string cluster_config_file = "nodes.conf";
+    std::optional<uint16_t> cluster_port;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -206,10 +215,49 @@ int main(int argc, char** argv) {
                 return 1;
             }
             repl_options.timeout = std::chrono::seconds(value);
+        } else if ((arg == "--cluster-enabled" || arg == "--cluster-require-full-coverage") && has_value) {
+            std::string value = argv[++i];
+            if (value != "yes" && value != "no") {
+                std::cerr << "invalid " << arg.substr(2) << ": " << value << "\n";
+                return 1;
+            }
+            (arg == "--cluster-enabled" ? cluster_enabled : cluster_options.require_full_coverage) = value == "yes";
+        } else if (arg == "--cluster-config-file" && has_value) {
+            cluster_config_file = argv[++i];
+            if (cluster_config_file.find('/') != std::string::npos) {
+                std::cerr << "cluster-config-file can't contain '/'; use --dir\n";
+                return 1;
+            }
+        } else if (arg == "--cluster-port" && has_value) {
+            char* end = nullptr;
+            long value = std::strtol(argv[++i], &end, 10);
+            if (*end != '\0' || value <= 0 || value > 65535) {
+                std::cerr << "invalid cluster-port: " << argv[i] << "\n";
+                return 1;
+            }
+            cluster_port = static_cast<uint16_t>(value);
+        } else if (arg == "--cluster-node-timeout" && has_value) {
+            char* end = nullptr;
+            long value = std::strtol(argv[++i], &end, 10);
+            if (*end != '\0' || value <= 0) {
+                std::cerr << "invalid cluster-node-timeout: " << argv[i] << "\n";
+                return 1;
+            }
+            cluster_options.node_timeout = std::chrono::milliseconds(value);
         } else {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    if (cluster_enabled && replicaof) {
+        std::cerr << "--replicaof isn't allowed in cluster mode; use CLUSTER REPLICATE\n";
+        return 1;
+    }
+    // The bus port defaults to port + 10000, as in Redis.
+    if (cluster_enabled && !cluster_port && port > 65535 - 10000) {
+        std::cerr << "port " << port << " + 10000 is out of range; pass --cluster-port\n";
+        return 1;
     }
 
     Store store(store_options);
@@ -219,6 +267,21 @@ int main(int argc, char** argv) {
     CommandDispatcher dispatcher(store);
     dispatcher.set_persistence(&persistence);
     dispatcher.set_replication(&replication);
+
+    std::unique_ptr<Cluster> cluster;
+    if (cluster_enabled) {
+        cluster_options.config_file = fileutil::join(persistence_options.dir, cluster_config_file);
+        cluster_options.bind_addr = bind_addr;
+        cluster_options.port = port;
+        cluster_options.cport = cluster_port ? *cluster_port : static_cast<uint16_t>(port + 10000);
+        cluster = std::make_unique<Cluster>(store, replication, cluster_options);
+        std::string error;
+        if (!cluster->load_config(error)) {
+            std::cerr << "fatal: can't load the cluster config: " << error << "\n";
+            return 1;
+        }
+        dispatcher.set_cluster(cluster.get());
+    }
 
     // Every change to the dataset goes to both the AOF and the replicas, in
     // the same deterministic form. Not while loading from disk: that data
@@ -247,18 +310,30 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "loaded " << store.size() << " keys from disk\n";
+    if (cluster) {
+        cluster->verify_config_with_data();
+    }
 
     Server server(bind_addr, port, dispatcher);
     server.set_replication(&replication);
     replication.attach(&server);
-    server.set_cron(kCronInterval, [&store, &persistence, &replication] {
+    Cluster* cl = cluster.get();
+    server.set_cron(kCronInterval, [&store, &persistence, &replication, cl] {
         store.active_expire_cycle(kActiveExpireBudget);  // a no-op on a replica
         persistence.cron();
         replication.cron();
+        if (cl != nullptr) {
+            cl->cron();
+        }
     });
-    // Replication first: clients it unblocks may run writes, which the AOF
+    // Cluster first: losing a slot deletes its keys, and those DELs must
+    // reach the replication stream and the AOF flush that follow.
+    // Replication next: clients it unblocks may run writes, which the AOF
     // flush right after must include before their replies go out.
-    server.set_before_sleep([&persistence, &replication] {
+    server.set_before_sleep([&persistence, &replication, cl] {
+        if (cl != nullptr) {
+            cl->before_sleep();
+        }
         replication.before_sleep();
         persistence.before_sleep();
     });
@@ -266,9 +341,17 @@ int main(int argc, char** argv) {
     if (!server.start()) {
         return 1;
     }
+    if (cluster && !cluster->start(&server)) {
+        return 1;
+    }
     if (replicaof) {
         replication.replicaof(replicaof->first, replicaof->second);
     }
     server.run();
-    return persistence.shutdown() ? 0 : 1;
+    bool ok = persistence.shutdown();
+    if (cluster && !cluster->shutdown()) {
+        std::cerr << "can't save the cluster config\n";
+        ok = false;
+    }
+    return ok ? 0 : 1;
 }

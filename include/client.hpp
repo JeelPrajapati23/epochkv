@@ -49,6 +49,12 @@ struct Client {
     std::string repl_held;  // stream produced while the snapshot is made and sent
     int repl_snapshot_fd = -1;
 
+    // Cluster mode. asking: the previous command was ASKING, so the next
+    // one may touch a slot this node is importing (one-shot). readonly: the
+    // client accepts possibly stale reads from a replica (READONLY).
+    bool asking = false;
+    bool readonly = false;
+
     bool is_master = false;
     SteadyTime last_interaction{};  // last read from this peer
 };

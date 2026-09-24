@@ -7,7 +7,9 @@
 #include <list>
 #include <random>
 #include <string>
+#include <vector>
 
+#include "cluster_slot.hpp"
 #include "hash_table.hpp"
 
 enum class EvictionPolicy {
@@ -20,6 +22,8 @@ enum class EvictionPolicy {
 //   dict_     key -> {value, position in lru_}
 //   expires_  key -> absolute expiry (unix ms); only keys that have a TTL
 //   lru_      keys, most recently used at the front
+//   slots_    per cluster hash slot, the keys in it (pointers to the key
+//             strings inside lru_ nodes, which never move)
 //
 // Expired keys are removed lazily (any access to an expired key deletes it
 // first) and actively (active_expire_cycle() samples keys with a TTL), so
@@ -52,6 +56,9 @@ public:
     // the next write to the store.
     const std::string* get(const std::string& key);
     bool exists(const std::string& key);
+    // exists() without counting as a use of the key (no LRU touch): for
+    // checks the server makes on its own behalf, like cluster routing.
+    bool contains(const std::string& key) { return lookup(key, false) != nullptr; }
     // Overwrites any existing value. Clears an existing TTL unless keep_ttl.
     void set(const std::string& key, std::string value, bool keep_ttl = false);
     bool del(const std::string& key);
@@ -98,6 +105,17 @@ public:
         });
     }
 
+    // Keys per cluster hash slot, including expired ones not yet reclaimed
+    // (Redis's CLUSTER COUNTKEYSINSLOT / GETKEYSINSLOT have the same view).
+    // Kept whether or not cluster mode is on: it's one list node per key,
+    // and moving a slot to another node needs its keys without a full scan.
+    size_t count_keys_in_slot(int slot) const { return slots_[slot].size(); }
+    std::vector<std::string> keys_in_slot(int slot, size_t max) const;
+    // Deletes every key in `slot` (this node lost the slot to another one).
+    // The deletion listener is told, so the DELs reach the AOF and replicas.
+    // Returns how many keys were deleted.
+    size_t delete_slot(int slot);
+
     int64_t now_ms() const { return options_.clock(); }
     size_t size() const { return dict_.size(); }
     size_t used_memory() const { return used_memory_; }
@@ -108,6 +126,7 @@ private:
     struct Entry {
         std::string value;
         std::list<std::string>::iterator lru_pos;
+        std::list<const std::string*>::iterator slot_pos;
     };
 
     // Lazily expires `key`, then returns its entry (nullptr if absent or
@@ -127,6 +146,7 @@ private:
     HashTable<Entry> dict_;
     HashTable<int64_t> expires_;
     std::list<std::string> lru_;
+    std::vector<std::list<const std::string*>> slots_;
     std::mt19937_64 rng_;
     bool passive_expiry_ = false;
 

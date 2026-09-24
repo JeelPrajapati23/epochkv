@@ -10,12 +10,12 @@ A distributed key-value store (Redis-like) built from scratch in C++, with a Pyt
 - [x] TTL & LRU eviction
 - [x] Persistence (AOF + snapshotting)
 - [x] Replication (master-replica)
-- [ ] Sharding (consistent hashing)
+- [x] Sharding (Redis Cluster-style hash slots, gossip, live resharding)
 - [ ] Fault tolerance (simplified leader election) — stretch goal
 - [ ] Python client + benchmark harness (+ optional vector-search extension)
 - [ ] Benchmarks and documentation
 
-Supported commands: `PING`, `ECHO`, `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`), `GET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `DBSIZE`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE`, `REPLICAOF`, `WAIT`, `INFO`.
+Supported commands: `PING`, `ECHO`, `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`), `GET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `DBSIZE`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE`, `REPLICAOF`, `WAIT`, `INFO`, `DUMP`, `RESTORE`, `MIGRATE`, `CLUSTER` (`INFO`, `NODES`, `SLOTS`, `MYID`, `MEET`, `ADDSLOTS[RANGE]`, `DELSLOTS[RANGE]`, `SETSLOT`, `KEYSLOT`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `REPLICATE`, `FORGET`, `SET-CONFIG-EPOCH`, `BUMPEPOCH`, `SAVECONFIG`), `ASKING`, `READONLY`, `READWRITE`.
 
 ## Build and run
 
@@ -60,10 +60,32 @@ Or at runtime: `REPLICAOF host port`, and `REPLICAOF NO ONE` to promote a replic
 - **`WAIT numreplicas timeout`** blocks a client until its writes are acknowledged by that many replicas. This narrows the window for losing an acknowledged write if the master crashes, but doesn't make replication synchronous or strongly consistent.
 - `INFO replication` shows the role, link status, offsets, attached replicas and sync counters. Dead links are detected after `--repl-timeout` seconds (default 60).
 
+## Cluster mode (sharding)
+
+Data is split across several masters the way Redis Cluster does it, so standard cluster-aware Redis clients work unchanged:
+
+```sh
+for p in 7000 7001 7002; do mkdir -p data/$p; ./build/src/kv_server --port $p --dir data/$p --cluster-enabled yes & done
+python3 tools/kv_cluster.py create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002      # --replicas N for replicas
+python3 tools/kv_cluster.py reshard --from 127.0.0.1:7000 --to 127.0.0.1:7001 --slots 1000
+python3 tools/kv_cluster.py check 127.0.0.1:7000
+```
+
+- **Hash slots:** every key maps to one of 16384 slots (`CRC16(key) mod 16384`), and each master owns a set of slots. `{hash tags}` put related keys in the same slot, so multi-key commands work on them; multi-key commands across slots get `-CROSSSLOT`.
+- **Redirects, not proxying:** a node asked about a key it doesn't own replies `-MOVED <slot> <ip>:<port>`, and the client updates its slot map. There is no extra hop on the data path.
+- **Cluster bus:** nodes talk on a second port (client port + 10000, or `--cluster-port`). They PING each other and gossip their slots, config epochs, and a few other nodes they know, so one `CLUSTER MEET` joins a node to the whole cluster. When two nodes claim the same slot, the claim with the higher config epoch wins, and equal epochs are broken by node ID.
+- **Live resharding:** slots move while the cluster serves traffic. The target marks the slot `IMPORTING`, the source `MIGRATING`, and keys move in batches with `MIGRATE` (atomic per batch). During the move, clients get `-ASK` for keys already transferred. `SETSLOT NODE` finishes the move, and the target takes a new config epoch so its claim spreads.
+- **Replicas:** `CLUSTER REPLICATE <id>` sets up replication over the existing PSYNC stream. Replicas redirect writes to their master, and serve reads only on connections that sent `READONLY`.
+- **State on disk:** each node keeps its ID, epochs and slot map in `nodes.conf` (in `--dir`), so it rejoins with the same identity after a restart.
+- Options: `--cluster-node-timeout MS` (default 15000), `--cluster-config-file NAME`, `--cluster-require-full-coverage yes|no` (refuse key commands while any slot is unowned; default yes).
+
+Failure detection and automatic failover aren't implemented yet: a dead master's slots stay unavailable until an operator steps in.
+
 ## Tests
 
 ```sh
 (cd build && ctest)                             # unit tests (Catch2)
 python3 tests/integration/test_server.py        # end-to-end tests against the real binary
 python3 tests/integration/test_replication.py   # multi-process replication tests
+python3 tests/integration/test_cluster.py       # multi-process cluster tests (gossip, redirects, live resharding)
 ```

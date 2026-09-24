@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 
 #include "store.hpp"
 
@@ -34,5 +35,16 @@ enum class LoadResult { kOk, kNotFound, kError };
 // truncation or checksum mismatch; the caller should refuse to start rather
 // than serve a dataset it knows is damaged.
 LoadResult load(const std::string& path, Store& store, std::string& error);
+
+// DUMP / RESTORE payload: a single value in the snapshot's encoding, how
+// keys travel between cluster nodes when a slot moves (MIGRATE):
+//
+//   0x00 <vallen> <value> <version:u16> <crc32:u32>
+//
+// The checksum and version let the receiver refuse a damaged payload, or
+// one written by an incompatible server, instead of storing garbage.
+std::string dump_value(const std::string& value);
+// False if the payload is truncated, has a bad checksum or an unknown version.
+bool restore_value(std::string_view payload, std::string& value);
 
 }  // namespace snapshot

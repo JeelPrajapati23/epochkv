@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -25,6 +26,9 @@ void bulk_string(std::string& out, std::string_view s);
 
 // $-1\r\n — "no such key".
 void null_bulk(std::string& out);
+
+// *<n>\r\n — header of an array; the caller then appends n replies.
+void array_header(std::string& out, size_t n);
 
 // *<n>\r\n followed by n bulk strings: a command as clients send it. Also
 // the wire format of the AOF and of the replication stream.

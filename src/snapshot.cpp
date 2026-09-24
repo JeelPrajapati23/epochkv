@@ -333,6 +333,60 @@ bool save(const Store& store, const std::string& path) {
     return true;
 }
 
+std::string dump_value(const std::string& value) {
+    std::string payload(1, static_cast<char>(kOpString));
+    uint64_t len = value.size();
+    do {
+        uint8_t byte = len & 0x7F;
+        len >>= 7;
+        payload += static_cast<char>(len != 0 ? byte | 0x80 : byte);
+    } while (len != 0);
+    payload += value;
+    payload += static_cast<char>(kVersion);
+    payload += '\0';  // the version is a u16 on the wire, as in Redis's DUMP
+    uint32_t crc = crc32_update(0, payload.data(), payload.size());
+    for (int i = 0; i < 4; ++i) {
+        payload += static_cast<char>((crc >> (8 * i)) & 0xFF);
+    }
+    return payload;
+}
+
+bool restore_value(std::string_view payload, std::string& value) {
+    // type + 1-byte length + version + crc at the very least
+    if (payload.size() < 1 + 1 + 2 + 4) {
+        return false;
+    }
+    size_t body = payload.size() - 4;
+    uint32_t crc = 0;
+    for (int i = 0; i < 4; ++i) {
+        crc |= static_cast<uint32_t>(static_cast<uint8_t>(payload[body + i])) << (8 * i);
+    }
+    if (crc != crc32_update(0, payload.data(), body)) {
+        return false;
+    }
+    if (static_cast<uint8_t>(payload[body - 2]) != kVersion || payload[body - 1] != '\0' ||
+        static_cast<uint8_t>(payload[0]) != kOpString) {
+        return false;
+    }
+    size_t pos = 1;
+    uint64_t len = 0;
+    for (size_t i = 0;; ++i) {
+        if (i == kMaxVarintBytes || pos == body - 2) {
+            return false;
+        }
+        uint8_t byte = static_cast<uint8_t>(payload[pos++]);
+        len |= static_cast<uint64_t>(byte & 0x7F) << (7 * i);
+        if ((byte & 0x80) == 0) {
+            break;
+        }
+    }
+    if (len != body - 2 - pos) {
+        return false;
+    }
+    value.assign(payload.substr(pos, static_cast<size_t>(len)));
+    return true;
+}
+
 LoadResult load(const std::string& path, Store& store, std::string& error) {
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {

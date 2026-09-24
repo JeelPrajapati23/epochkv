@@ -7,6 +7,7 @@
 
 #include "store.hpp"
 
+class Cluster;
 class Persistence;
 class Replication;
 struct Client;
@@ -31,6 +32,9 @@ public:
     // Enables REPLICAOF/PSYNC/REPLCONF/WAIT/INFO, and refusing writes from
     // clients while this server is a replica.
     void set_replication(Replication* replication) { replication_ = replication; }
+    // Enables cluster mode: key commands are checked against the slot map
+    // and may be answered with a redirect (MOVED/ASK) instead of running.
+    void set_cluster(Cluster* cluster) { cluster_ = cluster; }
 
     // Executes `argv` and appends exactly one reply to `out`, with three
     // exceptions that append nothing: an empty argv (Redis silently ignores
@@ -48,6 +52,9 @@ private:
         // May grow memory: run eviction first, and refuse with -OOM if the
         // store is still over maxmemory (Redis's "denyoom" command flag).
         kDenyOom = 1u << 1,
+        // Runs in a slot being imported without a preceding ASKING, like
+        // RESTORE-ASKING (Redis's CMD_ASKING).
+        kAsking = 1u << 2,
     };
 
     struct CommandSpec {
@@ -57,6 +64,12 @@ private:
         // name); N < 0 means at least |N| args.
         int arity;
         unsigned flags;
+        // Which arguments are keys, for cluster routing (Redis's legacy key
+        // spec): argv[first..last] every `step`; last < 0 counts from the
+        // end (-1 = the last argument). first = 0: no keys.
+        int first_key;
+        int last_key;
+        int key_step;
     };
 
     static bool arity_ok(int arity, size_t argc);
@@ -86,6 +99,14 @@ private:
     void cmd_psync(const Args& argv, std::string& out);
     void cmd_wait(const Args& argv, std::string& out);
     void cmd_info(const Args& argv, std::string& out);
+    void cmd_dump(const Args& argv, std::string& out);
+    void cmd_restore(const Args& argv, std::string& out);
+    void cmd_migrate(const Args& argv, std::string& out);
+    void cmd_cluster(const Args& argv, std::string& out);
+    void cmd_asking(const Args& argv, std::string& out);
+    void cmd_readonly(const Args& argv, std::string& out);
+    void cmd_readwrite(const Args& argv, std::string& out);
+    bool cluster_enabled(std::string& out);
 
     // relative: the argument is a TTL (EXPIRE) rather than a timestamp (EXPIREAT).
     void expire_generic(const Args& argv, int64_t unit_ms, bool relative, const char* name, std::string& out);
@@ -94,6 +115,7 @@ private:
     Propagator propagator_;
     Persistence* persistence_ = nullptr;
     Replication* replication_ = nullptr;
+    Cluster* cluster_ = nullptr;
     Client* client_ = nullptr;  // sender of the command being dispatched
     // Keyed by uppercase command name; built once, looked up per command.
     std::unordered_map<std::string, CommandSpec> table_;

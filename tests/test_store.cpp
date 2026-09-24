@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -297,4 +298,50 @@ TEST_CASE("clear drops every key and resets memory accounting", "[store]") {
     store.set("a", "again");
     REQUIRE(*store.get("a") == "again");
     REQUIRE(store.pttl("a") == -1);
+}
+
+TEST_CASE("keys are indexed by cluster hash slot", "[store][cluster]") {
+    FakeClock clock;
+    Store store = make_store(clock);
+    // Same hash tag, same slot.
+    store.set("{user:1}:name", "a");
+    store.set("{user:1}:email", "b");
+    store.set("other", "c");
+    int slot = cluster::key_hash_slot("{user:1}:name");
+    REQUIRE(store.count_keys_in_slot(slot) == 2);
+    REQUIRE(store.count_keys_in_slot(cluster::key_hash_slot("other")) == 1);
+
+    std::vector<std::string> keys = store.keys_in_slot(slot, 10);
+    std::sort(keys.begin(), keys.end());
+    REQUIRE(keys == std::vector<std::string>{"{user:1}:email", "{user:1}:name"});
+    REQUIRE(store.keys_in_slot(slot, 1).size() == 1);
+
+    // Overwriting doesn't duplicate; deleting and expiring unindex.
+    store.set("{user:1}:name", "a2");
+    REQUIRE(store.count_keys_in_slot(slot) == 2);
+    store.del("{user:1}:name");
+    REQUIRE(store.count_keys_in_slot(slot) == 1);
+    store.set_expire("{user:1}:email", clock.now + 10);
+    clock.now += 20;
+    REQUIRE(store.get("{user:1}:email") == nullptr);
+    REQUIRE(store.count_keys_in_slot(slot) == 0);
+
+    store.clear();
+    REQUIRE(store.count_keys_in_slot(cluster::key_hash_slot("other")) == 0);
+}
+
+TEST_CASE("delete_slot removes every key in the slot and notifies", "[store][cluster]") {
+    FakeClock clock;
+    Store store = make_store(clock);
+    std::vector<std::string> deleted;
+    store.set_deletion_listener([&deleted](const std::string& key) { deleted.push_back(key); });
+    store.set("{t}a", "1");
+    store.set("{t}b", "2");
+    store.set("elsewhere", "3");
+    int slot = cluster::key_hash_slot("{t}");
+    REQUIRE(store.delete_slot(slot) == 2);
+    REQUIRE(store.count_keys_in_slot(slot) == 0);
+    REQUIRE(store.size() == 1);
+    REQUIRE(deleted.size() == 2);
+    REQUIRE(*store.get("elsewhere") == "3");
 }

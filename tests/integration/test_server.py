@@ -71,6 +71,9 @@ class Client:
                 self._fill()
             data, self.buf = self.buf[:n], self.buf[n + 2:]
             return data
+        if kind == b"*":
+            n = int(rest)
+            return None if n == -1 else [self.read_reply() for _ in range(n)]
         raise ValueError("unexpected reply: %r" % line)
 
     def cmd(self, *parts):

@@ -56,6 +56,8 @@ public:
     void attach(ClientHost* host) { host_ = host; }
 
     bool is_replica() const { return !master_host_.empty(); }
+    const std::string& master_host() const { return master_host_; }
+    uint16_t master_port() const { return master_port_; }
     uint64_t offset() const { return backlog_.offset(); }
     const std::string& replid() const { return replid_; }
 
