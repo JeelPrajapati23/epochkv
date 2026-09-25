@@ -1,6 +1,8 @@
-# KV Store
+# Shardis
 
-A distributed key-value store built from scratch in C++17. It speaks the Redis protocol (RESP), so `redis-cli`, `redis-benchmark` and cluster-aware Redis clients work with it unchanged. It includes a cluster-aware Python client and a benchmark harness.
+**A Redis-compatible distributed key-value store, built from scratch in C++17.**
+
+Shardis is a sharded, replicated key-value store with automatic failover. It speaks the Redis protocol (RESP), so `redis-cli`, `redis-benchmark` and cluster-aware Redis clients work with it unchanged. It includes a cluster-aware Python client and a benchmark harness.
 
 A single node is a single-threaded epoll server with key expiry, LRU eviction, and persistence through fork-based snapshots plus an append-only file. Nodes can be chained into master-replica replication with partial resync. A cluster shards data over 16384 hash slots, coordinates over a gossip bus, moves slots live while serving traffic, and fails over automatically when a master dies.
 
