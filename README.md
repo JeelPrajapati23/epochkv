@@ -1,19 +1,79 @@
 # KV Store
 
-A distributed key-value store (Redis-like) built from scratch in C++, with a Python client and benchmark harness.
+A distributed key-value store built from scratch in C++17. It speaks the Redis protocol (RESP), so `redis-cli`, `redis-benchmark` and cluster-aware Redis clients work with it unchanged. It includes a cluster-aware Python client and a benchmark harness.
+
+A single node is a single-threaded epoll server with key expiry, LRU eviction, and persistence through fork-based snapshots plus an append-only file. Nodes can be chained into master-replica replication with partial resync. A cluster shards data over 16384 hash slots, coordinates over a gossip bus, moves slots live while serving traffic, and fails over automatically when a master dies.
+
+**Headline numbers** (i7-13650HX, WSL2, loopback, 80/20 GET/SET, 64-byte values; see [Benchmarks](#benchmarks)):
+
+| | ops/s | p99 |
+|---|---|---|
+| 1 node, 16 clients, no pipelining | 50.6k | 639µs |
+| Redis 8.0.5, same harness and load | 48.4k | — |
+| 1 node, 12 clients × 64-deep pipelines (Python client) | **895k** | 1.25ms |
+| 3-node cluster, 12 clients × 64-deep pipelines | **1.23M** | 983µs |
+
+Without pipelining, throughput is within ~10% of Redis 8 under both our harness and `redis-benchmark`, and in both servers most CPU time goes to the kernel. Pipelining is 17× faster on one node because it removes a wakeup per request, which measurement showed to be the main cost.
+
+## Architecture
+
+```
+                    clients (redis-cli, kvclient, any RESP client)
+                                    │  RESP over TCP
+┌───────────────────────────────────▼──────────────────────────────────────┐
+│ kv_server: one thread, one epoll loop                                    │
+│                                                                          │
+│  socket read ─► incremental RESP parser ─► command table (arity, flags)  │
+│                                                  │                       │
+│                  cluster check: slot owner? ─────┤── no ─► -MOVED / -ASK │
+│                                                  ▼                       │
+│              Store: chained hash table + exact LRU list + TTL index      │
+│                    (lazy + sampled active expiry, maxmemory eviction)    │
+│                                                  │                       │
+│       ┌──────────────────────┬───────────────────┼──────────────────┐    │
+│       ▼                      ▼                   ▼                  │    │
+│  reply buffer ─► send   AOF (multi-part)   replication stream       │    │
+│                        fsync per policy   + circular backlog        │    │
+│                                                  │                  │    │
+│  cron: active expiry, save points, replica acks, cluster timers ◄───┘    │
+│  fork() child: snapshot / AOF rewrite / full-resync payload (CoW)        │
+└──────────────┬────────────────────────────────────┬──────────────────────┘
+               │ PSYNC                              │ cluster bus (port + 10000)
+               ▼                                    ▼
+           replicas                        other nodes: PING/PONG gossip,
+     (read-only, apply stream)             FAIL, failover votes, epochs
+```
+
+## Design decisions
+
+The main choices, and why. Each one was measured or argued against an alternative.
+
+- **Single-threaded, level-triggered epoll loop instead of a thread per connection.** Only one thread touches the store, so there are no locks, and a single thread can serve thousands of mostly idle connections. The cost is that commands use one core and a slow command stalls everyone. That's acceptable because in-memory commands take about 2µs and benchmarks showed most time goes to the kernel, not our code. Level-triggered mode (one 16KB read per wakeup) avoids edge-triggered's "missed one drain, client stuck forever" bug and keeps connections fair.
+- **Incremental RESP parser with hand-written validation.** It handles any split of bytes across reads, so the network can deliver partial commands safely. Lengths are checked digit by digit rather than with `stoul`, because `stoul` silently accepts input like `-1` and `12abc`, and this input comes from untrusted clients.
+- **Replies appended to a per-connection output buffer.** A pipelined batch of 100 commands goes out in one `send()` instead of 100. This is what makes pipelining cheap on the server side.
+- **Separate-chaining hash table with FNV-1a, plus an exact LRU (hash map + linked list).** Chaining makes deletion simple (no tombstones) and handles high load factors well. LRU is exact and O(1) (`splice` moves a node without allocating), whereas Redis samples keys to save 16 bytes per key. That's the right trade at hundreds of millions of keys, not here.
+- **Expiry: lazy on access plus sampled active cleanup instead of a timer per key.** A key that outlives its TTL is invisible anyway, so cleanup doesn't have to be exact. Twenty random samples per round, with another round when more than 25% have expired, bound both memory held by dead keys and CPU spent collecting them. Deadlines use the wall clock, because they're written to disk; timers use a monotonic clock, so an NTP clock jump can't make them misfire.
+- **Snapshots and AOF together, both written by a `fork()`ed child.** Snapshots load fast but lose minutes of writes in a crash. The AOF loses at most one second but grows without limit. Using a snapshot as the AOF's base gets both benefits. `fork()` gives a consistent point-in-time copy for free through copy-on-write, and the multi-part AOF layout switches new writes to a fresh file *before* forking, so no rewrite buffer ever needs merging. Failed persistence refuses writes (`-MISCONF`) instead of losing them silently.
+- **Asynchronous replication with PSYNC and a circular backlog.** A replica that briefly disconnects resumes from its offset instead of re-copying the whole dataset. Replicas never expire keys on their own: the master's DELs drive that, so replicas can't diverge. `WAIT` narrows the window for losing acknowledged writes but is explicitly *not* strong consistency.
+- **Hash slots instead of a consistent-hashing ring.** Both move about 1/N of keys when membership changes. With slots, ownership is an explicit 16384-entry table: easy to inspect, cheap to gossip as a 2KB bitmap, and movable one slot at a time. That's what makes live resharding manageable. Clients are redirected (`MOVED`/`ASK`) rather than proxied, so stale routing costs one extra round trip instead of an extra hop on every request.
+- **Gossip plus config epochs instead of a central coordinator (ZooKeeper/etcd).** There's no extra system to run. Conflicting slot claims resolve deterministically: the higher epoch wins, and node ID breaks ties.
+- **Failover by majority vote, with split-brain guards.** A node is marked failed only when a majority of masters agree. A master votes at most once per epoch and saves the vote to disk before sending it. The most up-to-date replica tends to run first, because each replica waits longer the further it is behind. A master that can't reach a majority stops accepting writes, so a minority partition can't collect writes that the majority's failover would discard.
+- **Client retries are at-most-once.** Reads and redirected commands are retried. A write whose connection died without a reply raises `UncertainWriteError` instead of being re-sent, because re-sending could apply it twice. Inside a pipeline, a read isn't retried if an unacknowledged write to the same slot comes after it; otherwise the read could observe that later write.
+- **Measure before optimizing.** The benchmark harness has an open-loop mode to avoid coordinated omission, and a mergeable log-linear latency histogram with ≤3% error. It showed that server CPU per request tracked how often a reply had to wake a sleeping client, and that's what justified building pipelining.
+
+**Known limitations:**
+- Resizing the hash table rehashes everything at once and stalls every client. The fix is incremental rehashing.
+- There are no transactions (`MULTI`/`EXEC`), so a pipeline isn't atomic.
+- Replication is asynchronous, so an automatic failover can lose writes the old master acknowledged but never sent to its replica.
+- The 3-node benchmark numbers are limited by the Python load generator, not by the cluster.
 
 ## Features
 
-- [x] Project setup (CMake, Catch2 test harness, minimal blocking TCP server)
-- [x] Core single-node store (RESP protocol parser, hash table, command dispatcher)
-- [x] Concurrency (epoll-based event loop)
-- [x] TTL & LRU eviction
-- [x] Persistence (AOF + snapshotting)
-- [x] Replication (master-replica)
-- [x] Sharding (Redis Cluster-style hash slots, gossip, live resharding)
-- [x] Fault tolerance (failure detection and automatic failover by replica election)
-- [ ] Python client + benchmark harness (+ optional vector-search extension)
-- [ ] Benchmarks and documentation
+- Supports strings, TTLs and eviction, plus snapshots and an AOF.
+- Replication supports full and partial resync, chained replicas and `WAIT`.
+- Cluster mode supports hash slots, gossip, `MOVED`/`ASK`, live resharding, automatic failover and manual `CLUSTER FAILOVER`.
+- The Python client (`python-client/kvclient`) is cluster-aware and supports pipelining across nodes.
+- The benchmark harness (`bench/`) supports closed- and open-loop load, comparison with Redis, and runs through the real client.
 
 Supported commands: `PING`, `ECHO`, `SET` (with `EX`/`PX`/`EXAT`/`PXAT`/`NX`/`XX`/`KEEPTTL`), `GET`, `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `DBSIZE`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `LASTSAVE`, `REPLICAOF`, `WAIT`, `INFO`, `DUMP`, `RESTORE`, `MIGRATE`, `CLUSTER` (`INFO`, `NODES`, `SLOTS`, `MYID`, `MEET`, `ADDSLOTS[RANGE]`, `DELSLOTS[RANGE]`, `SETSLOT`, `KEYSLOT`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `REPLICATE`, `FORGET`, `FAILOVER`, `COUNT-FAILURE-REPORTS`, `SET-CONFIG-EPOCH`, `BUMPEPOCH`, `SAVECONFIG`), `ASKING`, `READONLY`, `READWRITE`.
 
