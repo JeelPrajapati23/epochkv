@@ -1,0 +1,146 @@
+{
+  "meta": {
+    "server": "redis",
+    "commit": "1d2f337",
+    "date": "2026-09-25 08:39:08",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "keys": 100000,
+    "value_size": 64,
+    "read_ratio": 0.8
+  },
+  "runs": [
+    {
+      "config": {
+        "clients": 1,
+        "workers": 1,
+        "duration": 10,
+        "warmup": 2,
+        "keys": 100000,
+        "value_size": 64,
+        "read_ratio": 0.8,
+        "pipeline": 1,
+        "rate": 0
+      },
+      "ops_per_sec": 11414,
+      "latency_us": {
+        "mean": 87.6,
+        "p50": 71.7,
+        "p90": 135.2,
+        "p99": 229.4,
+        "p99.9": 385.0,
+        "max": 5976.7
+      },
+      "server_cpu_pct": 41.5,
+      "server_user_pct": 11.1,
+      "server_sys_pct": 30.4,
+      "client_cpu_pct_max": 52.0,
+      "errors": 0,
+      "repeats_ops_per_sec": [
+        11102,
+        11414,
+        13237
+      ]
+    },
+    {
+      "config": {
+        "clients": 4,
+        "workers": 4,
+        "duration": 10,
+        "warmup": 2,
+        "keys": 100000,
+        "value_size": 64,
+        "read_ratio": 0.8,
+        "pipeline": 1,
+        "rate": 0
+      },
+      "ops_per_sec": 45172,
+      "latency_us": {
+        "mean": 88.6,
+        "p50": 86.0,
+        "p90": 110.6,
+        "p99": 188.4,
+        "p99.9": 344.1,
+        "max": 3704.2
+      },
+      "server_cpu_pct": 99.4,
+      "server_user_pct": 15.7,
+      "server_sys_pct": 83.7,
+      "client_cpu_pct_max": 29.3,
+      "errors": 0,
+      "repeats_ops_per_sec": [
+        43962,
+        45172,
+        46474
+      ]
+    },
+    {
+      "config": {
+        "clients": 16,
+        "workers": 16,
+        "duration": 10,
+        "warmup": 2,
+        "keys": 100000,
+        "value_size": 64,
+        "read_ratio": 0.8,
+        "pipeline": 1,
+        "rate": 0
+      },
+      "ops_per_sec": 48444,
+      "latency_us": {
+        "mean": 330.3,
+        "p50": 311.3,
+        "p90": 393.2,
+        "p99": 622.6,
+        "p99.9": 1114.1,
+        "max": 9437.7
+      },
+      "server_cpu_pct": 100.0,
+      "server_user_pct": 11.9,
+      "server_sys_pct": 88.1,
+      "client_cpu_pct_max": 9.4,
+      "errors": 0,
+      "repeats_ops_per_sec": [
+        48351,
+        48444,
+        49055
+      ]
+    },
+    {
+      "config": {
+        "clients": 64,
+        "workers": 18,
+        "duration": 10,
+        "warmup": 2,
+        "keys": 100000,
+        "value_size": 64,
+        "read_ratio": 0.8,
+        "pipeline": 1,
+        "rate": 0
+      },
+      "ops_per_sec": 60032,
+      "latency_us": {
+        "mean": 1066.2,
+        "p50": 1048.6,
+        "p90": 1212.4,
+        "p99": 1998.8,
+        "p99.9": 2555.9,
+        "max": 6110.7
+      },
+      "server_cpu_pct": 99.9,
+      "server_user_pct": 9.9,
+      "server_sys_pct": 90.0,
+      "client_cpu_pct_max": 9.1,
+      "errors": 0,
+      "repeats_ops_per_sec": [
+        58277,
+        60032,
+        60700
+      ]
+    }
+  ]
+}

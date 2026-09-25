@@ -1,0 +1,123 @@
+{
+  "meta": {
+    "server": "redis",
+    "commit": "1d2f337",
+    "date": "2026-09-25 08:40:54",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "keys": 100000,
+    "value_size": 64,
+    "read_ratio": 0.8
+  },
+  "tool": "redis-benchmark",
+  "runs": [
+    {
+      "clients": 1,
+      "test": "SET",
+      "ops_per_sec": 16562,
+      "latency_ms": {
+        "avg": 0.057,
+        "min": 0.016,
+        "p50": 0.055,
+        "p95": 0.087,
+        "p99": 0.127,
+        "max": 4.199
+      }
+    },
+    {
+      "clients": 1,
+      "test": "GET",
+      "ops_per_sec": 16214,
+      "latency_ms": {
+        "avg": 0.058,
+        "min": 0.016,
+        "p50": 0.055,
+        "p95": 0.095,
+        "p99": 0.135,
+        "max": 8.495
+      }
+    },
+    {
+      "clients": 4,
+      "test": "SET",
+      "ops_per_sec": 100200,
+      "latency_ms": {
+        "avg": 0.03,
+        "min": 0.008,
+        "p50": 0.023,
+        "p95": 0.063,
+        "p99": 0.127,
+        "max": 2.191
+      }
+    },
+    {
+      "clients": 4,
+      "test": "GET",
+      "ops_per_sec": 100976,
+      "latency_ms": {
+        "avg": 0.029,
+        "min": 0.008,
+        "p50": 0.023,
+        "p95": 0.055,
+        "p99": 0.111,
+        "max": 1.975
+      }
+    },
+    {
+      "clients": 16,
+      "test": "SET",
+      "ops_per_sec": 125261,
+      "latency_ms": {
+        "avg": 0.075,
+        "min": 0.024,
+        "p50": 0.071,
+        "p95": 0.111,
+        "p99": 0.199,
+        "max": 0.639
+      }
+    },
+    {
+      "clients": 16,
+      "test": "GET",
+      "ops_per_sec": 122499,
+      "latency_ms": {
+        "avg": 0.077,
+        "min": 0.024,
+        "p50": 0.071,
+        "p95": 0.119,
+        "p99": 0.215,
+        "max": 2.815
+      }
+    },
+    {
+      "clients": 64,
+      "test": "SET",
+      "ops_per_sec": 132802,
+      "latency_ms": {
+        "avg": 0.263,
+        "min": 0.08,
+        "p50": 0.247,
+        "p95": 0.319,
+        "p99": 0.431,
+        "max": 38.815
+      }
+    },
+    {
+      "clients": 64,
+      "test": "GET",
+      "ops_per_sec": 132333,
+      "latency_ms": {
+        "avg": 0.258,
+        "min": 0.072,
+        "p50": 0.255,
+        "p95": 0.319,
+        "p99": 0.415,
+        "max": 2.823
+      }
+    }
+  ]
+}

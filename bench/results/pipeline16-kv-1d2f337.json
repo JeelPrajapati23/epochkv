@@ -1,0 +1,47 @@
+{
+  "meta": {
+    "server": "kv",
+    "commit": "1d2f337",
+    "date": "2026-09-25 08:45:27",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "keys": 100000,
+    "value_size": 64,
+    "read_ratio": 0.8
+  },
+  "runs": [
+    {
+      "config": {
+        "clients": 16,
+        "workers": 16,
+        "duration": 10,
+        "warmup": 2,
+        "keys": 100000,
+        "value_size": 64,
+        "read_ratio": 0.8,
+        "pipeline": 16,
+        "rate": 0
+      },
+      "ops_per_sec": 470554,
+      "latency_us": {
+        "mean": 544.1,
+        "p50": 442.4,
+        "p90": 868.4,
+        "p99": 1015.8,
+        "p99.9": 1343.5,
+        "max": 5777.9
+      },
+      "server_cpu_pct": 99.9,
+      "server_user_pct": 42.6,
+      "server_sys_pct": 57.3,
+      "server_sleeps_per_op": 0.0,
+      "client_cpu_pct_max": 10.6,
+      "errors": 0,
+      "client_sleeps_per_op": 0.062
+    }
+  ]
+}
