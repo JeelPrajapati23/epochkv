@@ -89,6 +89,60 @@ def parse_addr(s):
     return host, int(port)
 
 
+class _Cmd:
+    """A queued command and where it's headed next."""
+
+    __slots__ = ("args", "slot", "is_write", "addr", "asking", "redirects", "error")
+
+    def __init__(self, args, slot, is_write):
+        self.args, self.slot, self.is_write = args, slot, is_write
+        self.addr, self.asking, self.redirects, self.error = None, False, 0, None
+
+
+_PENDING = object()
+
+
+class Pipeline:
+    """Queues commands and sends them in batches: one write per node, all
+    nodes at once, then the replies are read and put back in queue order.
+
+    Not a transaction: other clients' commands can run in between, and a
+    failed command doesn't undo the ones before it. Commands on the same key
+    run in queue order; commands on different keys may run in any order."""
+
+    def __init__(self, client, chunk=10000):
+        self.client = client
+        self.chunk = chunk  # bounds the replies a node buffers for us
+        self.queue = []
+
+    def __len__(self):
+        return len(self.queue)
+
+    def call(self, *args, key=None):
+        keys, is_write = command_keys(args)
+        if key is not None:
+            keys = [key]
+        slots = {key_slot(k) for k in keys}
+        if len(slots) > 1:
+            raise CrossSlotError("CROSSSLOT Keys in request don't hash to the same slot")
+        self.queue.append(_Cmd(args, slots.pop() if slots else None, is_write))
+        return self
+
+    def execute(self, raise_on_error=True):
+        """One result per queued command, in order. A failed command's slot
+        holds its exception. With raise_on_error, the first one is raised,
+        but only after every command has its result."""
+        cmds, self.queue = self.queue, []
+        results = []
+        for start in range(0, len(cmds), self.chunk):
+            results += self.client._execute(cmds[start:start + self.chunk])
+        if raise_on_error:
+            for r in results:
+                if isinstance(r, Exception):
+                    raise r
+        return results
+
+
 class ClusterClient:
     """Routes each command to the master owning its keys' slot.
 
@@ -149,7 +203,13 @@ class ClusterClient:
         for addr in list(self.known):
             try:
                 ranges = self.conn(addr).call("CLUSTER", "SLOTS")
-            except (OSError, ReplyError):
+            except ReplyError as e:
+                if "cluster support disabled" in str(e):
+                    self.slots = [addr] * SLOTS  # a standalone server owns every key
+                    return
+                self.drop(addr)
+                continue
+            except OSError:
                 self.drop(addr)
                 continue
             slots = [None] * SLOTS
@@ -170,10 +230,11 @@ class ClusterClient:
         owner = self.slots[slot] if slot is not None else None
         return owner or self.known[0]
 
-    def _recover(self, deadline, reason):
+    def _recover(self, deadline, reason=None):
         """Waits a moment for the cluster to reconfigure, then reloads the
-        map. Raises once the retry budget is spent."""
-        self.retries[reason] += 1
+        map. False once the retry budget is spent."""
+        if reason:
+            self.retries[reason] += 1
         if time.monotonic() > deadline:
             return False
         time.sleep(0.1)
@@ -185,68 +246,138 @@ class ClusterClient:
 
     # -- commands ----------------------------------------------------------
 
+    def pipeline(self, chunk=10000):
+        return Pipeline(self, chunk)
+
     def call(self, *args, key=None):
-        keys, is_write = command_keys(args)
-        if key is not None:
-            keys = [key]
-        slots = {key_slot(k) for k in keys}
-        if len(slots) > 1:
-            raise CrossSlotError("CROSSSLOT Keys in request don't hash to the same slot")
-        slot = slots.pop() if slots else None
+        """One command: a pipeline of one, so there's a single copy of the
+        routing and retry rules."""
+        return self.pipeline().call(*args, key=key).execute()[0]
 
-        addr, asking, redirects = self._owner(slot), False, 0
+    def _execute(self, cmds):
+        """Runs a batch until every command has a final result. Returns the
+        results in order, errors as exception objects."""
+        results = [_PENDING] * len(cmds)
+        for c in cmds:
+            c.addr = self._owner(c.slot)
+        pending = list(range(len(cmds)))
         deadline = time.monotonic() + self.retry_timeout
-        while True:
-            try:
-                c = self.conn(addr)
-            except OSError:
-                # Nothing was sent: safe to retry, reads and writes alike.
-                self.drop(addr)
-                if not self._recover(deadline, "connection"):
-                    raise
-                addr, asking = self._owner(slot), False
-                continue
-            try:
-                if asking:
-                    c.send_many([("ASKING",), args])  # one round trip, not two
-                    c.read_reply()
-                else:
-                    c.send(*args)
-                r = c.read_reply()
-            except OSError:
-                # Sent, but no reply: the command may or may not have run.
-                self.drop(addr)
-                if is_write:
-                    raise UncertainWriteError(
-                        "connection to %s:%d lost after sending %r; it may or may not have been applied"
-                        % (addr[0], addr[1], args[0]))
-                if not self._recover(deadline, "connection"):
-                    raise
-                addr, asking = self._owner(slot), False
-                continue
+        while pending:
+            groups = {}
+            for i in pending:
+                cmds[i].error = None
+                groups.setdefault(cmds[i].addr, []).append(i)
+            retry, reasons = [], set()
 
-            if not isinstance(r, ReplyError):
-                return r
-            # Every error below means the server did NOT run the command,
-            # so retrying is safe even for writes.
-            kind, _, rest = str(r).partition(" ")
-            if kind in ("MOVED", "ASK"):
-                redirects += 1
-                if redirects > self.max_redirects:
-                    raise ReplyError("too many redirects for %r" % (args,))
-                self.redirects[kind] += 1
-                moved_slot, target = rest.split()
-                target = parse_addr(target)
-                self._learn(target)
-                if kind == "MOVED":
-                    self.slots[int(moved_slot)] = target  # ownership changed for good
-                addr, asking = target, kind == "ASK"  # ASK: this command only
-            elif kind == "TRYAGAIN" and time.monotonic() < deadline:
-                # Keys split between source and target mid-migration.
-                self.redirects[kind] += 1
-                time.sleep(0.01)
-                addr, asking = self._owner(slot), False
-            elif kind == "CLUSTERDOWN" and self._recover(deadline, "CLUSTERDOWN"):
-                addr, asking = self._owner(slot), False
+            # 1. Every node gets its commands before any reply is read, so
+            #    the nodes work in parallel.
+            sent = []
+            for addr, idxs in groups.items():
+                try:
+                    conn = self.conn(addr)
+                except OSError as e:
+                    self.drop(addr)  # nothing was sent: safe to retry them all
+                    for i in idxs:
+                        cmds[i].error = e
+                    retry += idxs
+                    reasons.add("connection")
+                    continue
+                frames = []
+                for i in idxs:
+                    if cmds[i].asking:
+                        frames.append(("ASKING",))
+                    frames.append(cmds[i].args)
+                try:
+                    conn.send_many(frames)
+                except OSError as e:
+                    self.drop(addr)
+                    retry += self._lost(cmds, idxs, results, addr, e)
+                    reasons.add("connection")
+                    continue
+                sent.append((addr, conn, idxs))
+
+            # 2. Each node's replies come back in the order it got the commands.
+            for addr, conn, idxs in sent:
+                for n, i in enumerate(idxs):
+                    try:
+                        if cmds[i].asking:
+                            conn.read_reply()  # ASKING's +OK
+                        r = conn.read_reply()
+                    except OSError as e:
+                        self.drop(addr)
+                        retry += self._lost(cmds, idxs[n:], results, addr, e)
+                        reasons.add("connection")
+                        break
+                    if self._handle(cmds[i], r, results, i):
+                        retry.append(i)
+                        if cmds[i].error is not None:
+                            reasons.add(str(r).split(" ", 1)[0])
+
+            # 3. Errors that need the cluster to settle (a dead node,
+            #    CLUSTERDOWN, TRYAGAIN) share one wait and one map reload.
+            waiting = [i for i in retry if cmds[i].error is not None]
+            if waiting:
+                reason = "connection" if "connection" in reasons else (
+                    "CLUSTERDOWN" if "CLUSTERDOWN" in reasons else None)
+                if self._recover(deadline, reason):
+                    for i in waiting:
+                        cmds[i].addr, cmds[i].asking = self._owner(cmds[i].slot), False
+                else:
+                    for i in waiting:
+                        results[i] = cmds[i].error  # budget spent: the last error is final
+                    retry = [i for i in retry if results[i] is _PENDING]
+            # Queue order again, so commands on the same key keep their order.
+            pending = sorted(retry)
+        return results
+
+    def _handle(self, cmd, r, results, i):
+        """Records reply r for command i. True if it must be retried."""
+        if not isinstance(r, ReplyError):
+            results[i] = r
+            return False
+        # Every error handled below means the server did NOT run the
+        # command, so retrying is safe even for writes.
+        kind, _, rest = str(r).partition(" ")
+        if kind in ("MOVED", "ASK"):
+            cmd.redirects += 1
+            if cmd.redirects > self.max_redirects:
+                results[i] = ReplyError("too many redirects for %r" % (cmd.args,))
+                return False
+            self.redirects[kind] += 1
+            moved_slot, target = rest.split()
+            target = parse_addr(target)
+            self._learn(target)
+            if kind == "MOVED":
+                self.slots[int(moved_slot)] = target  # ownership changed for good
+            cmd.addr, cmd.asking = target, kind == "ASK"  # ASK: this command only
+            return True
+        if kind in ("TRYAGAIN", "CLUSTERDOWN"):
+            if kind == "TRYAGAIN":
+                self.redirects[kind] += 1  # keys split between source and target mid-migration
+            cmd.error = r
+            return True
+        results[i] = r  # a real command error (wrong type, bad arguments...)
+        return False
+
+    def _lost(self, cmds, idxs, results, addr, exc):
+        """Commands sent to addr whose replies never came: each may or may
+        not have run. Writes fail with UncertainWriteError. Reads are
+        retried, unless a lost write to the same slot comes after one in
+        the batch: retried now, the read could see that later write, and
+        per-key order would break. Returns the indices to retry."""
+        retry, uncertain_slots = [], set()
+        for i in reversed(idxs):
+            c = cmds[i]
+            if c.is_write:
+                results[i] = UncertainWriteError(
+                    "connection to %s:%d lost after sending %r; it may or may not have been applied"
+                    % (addr[0], addr[1], c.args[0]))
+                uncertain_slots.add(c.slot)
+            elif c.slot in uncertain_slots:
+                results[i] = ConnectionError(
+                    "connection to %s:%d lost; %r not retried: a later write to the same slot "
+                    "in this batch may or may not have been applied" % (addr[0], addr[1], c.args[0]))
             else:
-                raise r
+                c.error = exc
+                retry.append(i)
+        return retry

@@ -101,6 +101,7 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release && cmake --build build-re
 python3 bench/bench.py baseline                                   # 1/4/16/64 clients, median of 3 -> bench/results/
 python3 bench/bench.py run --clients 16 --pipeline 16             # one closed-loop run, 16-deep batches
 python3 bench/bench.py run --clients 16 --rate 40000              # open loop: honest tail latency at 40k ops/s
+python3 bench/bench.py run --client kvclient --clients 12 --pipeline 16 --nodes 3   # real client, 3-master cluster
 python3 bench/bench.py crosscheck                                 # same load via redis-benchmark (needs redis-tools)
 ```
 

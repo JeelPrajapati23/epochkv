@@ -140,6 +140,12 @@ class TestClusterClient(unittest.TestCase):
         self.assertEqual(self.a.commands("SET"), [("SET", low, "1")])
         self.assertEqual(self.b.commands("SET"), [("SET", high, "2")])
 
+    def test_standalone_server(self):
+        self.a.slot_map = ReplyError("ERR This instance has cluster support disabled")
+        self.client.refresh()
+        self.assertEqual(set(self.client.slots), {self.a.addr})
+        self.assertEqual(self.client.call("SET", "k", "v"), "OK")
+
     def test_keyless_command(self):
         self.a.handler = lambda args: "PONG"
         self.assertEqual(self.client.call("PING"), "PONG")
@@ -221,6 +227,129 @@ class TestClusterClient(unittest.TestCase):
         self.assertEqual(self.client.call("SET", "k", "v"), "OK")
         self.assertEqual(self.b.commands("SET"), [("SET", "k", "v")])
         self.assertEqual(self.client.slots[key_slot("k")], self.b.addr)
+
+
+class TestPipeline(unittest.TestCase):
+    """a owns slots 0-8191, b owns 8192-16383."""
+
+    def setUp(self):
+        self.a, self.b = FakeNode(), FakeNode()
+        self.a.slot_map = self.b.slot_map = [owns(self.a, 0, 8191), owns(self.b, 8192, SLOTS - 1)]
+        for node in (self.a, self.b):
+            node.handler = lambda args: b"v:" + args[1].encode() if args[0] == "GET" else "OK"
+        self.client = ClusterClient(self.a.addr, retry_timeout=1)
+
+    def tearDown(self):
+        self.client.close()
+        self.a.stop()
+        self.b.stop()
+
+    def keys_on(self, node, n, tag=None):
+        """n keys owned by node (all in one slot if tag is given)."""
+        lo = 0 if node is self.a else 8192
+        if tag:
+            tag = next(t for t in ("%s%d" % (tag, i) for i in range(1000)) if lo <= key_slot(t) < lo + 8192)
+            return ["{%s}%d" % (tag, i) for i in range(n)]
+        return [k for k in ("k%d" % i for i in range(100000)) if lo <= key_slot(k) < lo + 8192][:n]
+
+    def test_results_come_back_in_queue_order_across_nodes(self):
+        ka, kb = self.keys_on(self.a, 3), self.keys_on(self.b, 3)
+        order = [ka[0], kb[0], kb[1], ka[1], ka[2], kb[2]]
+        pipe = self.client.pipeline()
+        for k in order:
+            pipe.call("GET", k)
+        self.assertEqual(pipe.execute(), [b"v:" + k.encode() for k in order])
+        # Each node got only its own commands, in queue order.
+        self.assertEqual(self.a.commands("GET"), [("GET", k) for k in order if k in ka])
+        self.assertEqual(self.b.commands("GET"), [("GET", k) for k in order if k in kb])
+
+    def test_moved_inside_a_batch_retries_only_that_command(self):
+        k1, k2 = self.keys_on(self.a, 2)
+        moved = key_slot(k1)
+        self.a.handler = lambda args: (ReplyError("MOVED %d 127.0.0.1:%d" % (moved, self.b.addr[1]))
+                                       if args[1] == k1 else "OK")
+        self.assertEqual(self.client.pipeline().call("SET", k1, "1").call("SET", k2, "2").execute(), ["OK", "OK"])
+        self.assertEqual(self.b.commands("SET"), [("SET", k1, "1")])
+        self.assertEqual(len(self.a.commands("SET")), 2)  # k2 wasn't resent
+        self.assertEqual(self.client.slots[moved], self.b.addr)
+
+    def test_ask_inside_a_batch_is_sent_as_asking_pairs(self):
+        k1, k2 = self.keys_on(self.a, 2)
+        self.a.handler = lambda args: (ReplyError("ASK %d 127.0.0.1:%d" % (key_slot(args[1]), self.b.addr[1]))
+                                       if args[1] in (k1, k2) else "OK")
+        self.client.pipeline().call("GET", k1).call("GET", k2).execute()
+        self.assertEqual(self.b.log, [("ASKING",), ("GET", k1), ("ASKING",), ("GET", k2)])
+
+    def test_node_dying_mid_batch(self):
+        k = self.keys_on(self.a, 4)
+        kb = self.keys_on(self.b, 1)[0]
+        dies_once = [True]
+
+        def handler(args):
+            if args == ["GET", k[1]] and dies_once:
+                dies_once.pop()
+                return CLOSE  # the SET before it ran; nothing after it gets a reply
+            return b"v" if args[0] == "GET" else "OK"
+        self.a.handler = handler
+        self.client.retry_timeout = 10  # a refused connect takes ~2s on Windows
+        results = (self.client.pipeline().call("SET", k[0], "0").call("GET", k[1]).call("SET", k[2], "2")
+                   .call("GET", k[3]).call("SET", kb, "b").execute(raise_on_error=False))
+        self.assertEqual(results[0], "OK")  # answered before the connection died: final
+        self.assertEqual(results[1], b"v")  # a lost read: retried
+        self.assertIsInstance(results[2], UncertainWriteError)  # a lost write: not retried
+        self.assertEqual(results[3], b"v")  # a lost read, in another slot: retried
+        self.assertEqual(results[4], "OK")  # the other node was unaffected
+        # The SET on k[2] was sent but never reached the handler (the node
+        # died first), and the client didn't send it again.
+        self.assertEqual(self.a.commands("SET"), [("SET", k[0], "0")])
+
+    def test_lost_read_before_lost_write_to_same_slot_is_not_retried(self):
+        r, w = self.keys_on(self.a, 2, tag="t")  # same slot
+        self.a.handler = lambda args: CLOSE
+        results = self.client.pipeline().call("GET", r).call("SET", w, "1").execute(raise_on_error=False)
+        # Retrying the GET could let it see the SET queued after it.
+        self.assertIsInstance(results[0], ConnectionError)
+        self.assertNotIsInstance(results[0], UncertainWriteError)
+        self.assertIsInstance(results[1], UncertainWriteError)
+        self.assertEqual(len(self.a.commands("GET")), 1)
+
+    def test_lost_read_after_lost_write_to_same_slot_is_retried(self):
+        w, r = self.keys_on(self.a, 2, tag="t")
+        dies_once = [True]
+
+        def handler(args):
+            if dies_once:
+                dies_once.pop()
+                return CLOSE
+            return b"v"
+        self.a.handler = handler
+        results = self.client.pipeline().call("SET", w, "1").call("GET", r).execute(raise_on_error=False)
+        self.assertIsInstance(results[0], UncertainWriteError)
+        self.assertEqual(results[1], b"v")  # either outcome of the SET is a valid thing to see
+
+    def test_command_error_raises_after_everything_ran(self):
+        k1, k2 = self.keys_on(self.a, 2)
+        self.a.handler = lambda args: ReplyError("ERR boom") if args[1] == k1 else "OK"
+        pipe = self.client.pipeline().call("SET", k1, "1").call("SET", k2, "2")
+        with self.assertRaisesRegex(ReplyError, "boom"):
+            pipe.execute()
+        self.assertEqual(len(self.a.commands("SET")), 2)  # the second command still ran
+        results = self.client.pipeline().call("SET", k1, "1").call("SET", k2, "2").execute(raise_on_error=False)
+        self.assertIsInstance(results[0], ReplyError)
+        self.assertEqual(results[1], "OK")
+
+    def test_chunks_keep_order(self):
+        keys = self.keys_on(self.a, 7)
+        pipe = self.client.pipeline(chunk=3)
+        for key in keys:
+            pipe.call("GET", key)
+        self.assertEqual(pipe.execute(), [b"v:" + key.encode() for key in keys])
+        self.assertEqual(self.a.commands("GET"), [("GET", key) for key in keys])
+
+    def test_cross_slot_rejected_when_queued(self):
+        ka, kb = self.keys_on(self.a, 1)[0], self.keys_on(self.b, 1)[0]
+        with self.assertRaises(CrossSlotError):
+            self.client.pipeline().call("DEL", ka, kb)
 
 
 if __name__ == "__main__":

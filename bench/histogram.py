@@ -35,11 +35,11 @@ class Histogram:
         self.total = 0
         self.sum = 0
 
-    def record(self, value):
+    def record(self, value, count=1):
         k = bucket(value)
-        self.counts[k] = self.counts.get(k, 0) + 1
-        self.total += 1
-        self.sum += value
+        self.counts[k] = self.counts.get(k, 0) + count
+        self.total += count
+        self.sum += value * count
         if value > self.max:
             self.max = value
 
