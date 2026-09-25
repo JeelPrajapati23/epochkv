@@ -6,6 +6,12 @@ EpochKV is a sharded, replicated key-value store with automatic failover. It spe
 
 A single node is a single-threaded epoll server with key expiry, LRU eviction, and persistence through fork-based snapshots plus an append-only file. Nodes can be chained into master-replica replication with partial resync. A cluster shards data over 16384 hash slots, coordinates over a gossip bus, moves slots live while serving traffic, and fails over automatically when a master dies.
 
+### Demo: killing a master under live writes
+
+[![EpochKV failover demo](https://asciinema.org/a/AlZAYMDTe66dcSTJ.svg)](https://asciinema.org/a/AlZAYMDTe66dcSTJ)
+
+A 3-master, 3-replica cluster takes writes through the Python client while one master is killed with `kill -9`. The survivors suspect it (PFAIL), agree by majority (FAIL), and its replica wins an election and takes over its slots about 3 seconds after the kill. The script then checks every acknowledged write, and restarts the old master, which rejoins as a replica. Run it yourself with `python3 tools/demo_failover.py`.
+
 **Headline numbers** (i7-13650HX, WSL2, loopback, 80/20 GET/SET, 64-byte values; see [Benchmarks](#benchmarks)):
 
 | | ops/s | p99 |
