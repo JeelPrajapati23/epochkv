@@ -345,3 +345,22 @@ TEST_CASE("delete_slot removes every key in the slot and notifies", "[store][clu
     REQUIRE(deleted.size() == 2);
     REQUIRE(*store.get("elsewhere") == "3");
 }
+
+TEST_CASE("active_rehash finishes a resize that no write is driving", "[store][rehash]") {
+    FakeClock clock;
+    Store store = make_store(clock);
+    // Insert until an insert starts a grow (active_rehash reports it), then
+    // stop writing: only the timer can finish it now.
+    int n = 0;
+    do {
+        for (int i = 0; i < 1000; ++i, ++n) {
+            store.set("key" + std::to_string(n), "v");
+        }
+    } while (!store.active_rehash(std::chrono::microseconds(0)));
+    while (store.active_rehash(kGenerousBudget)) {
+    }
+    REQUIRE(store.size() == static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        REQUIRE(store.get("key" + std::to_string(i)) != nullptr);
+    }
+}

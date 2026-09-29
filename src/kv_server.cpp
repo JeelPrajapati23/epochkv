@@ -29,6 +29,9 @@ constexpr uint16_t kDefaultPort = 6380;
 constexpr std::chrono::milliseconds kCronInterval{100};
 // Active expiry may use at most 25% of each tick (Redis's ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC).
 constexpr std::chrono::microseconds kActiveExpireBudget{25'000};
+// Finishing an in-progress hash table resize gets 1ms per tick, as with
+// Redis's activerehashing.
+constexpr std::chrono::microseconds kActiveRehashBudget{1'000};
 
 void usage(const char* prog) {
     std::cerr << "usage: " << prog
@@ -334,6 +337,7 @@ int main(int argc, char** argv) {
     Cluster* cl = cluster.get();
     server.set_cron(kCronInterval, [&store, &persistence, &replication, cl] {
         store.active_expire_cycle(kActiveExpireBudget);  // a no-op on a replica
+        store.active_rehash(kActiveRehashBudget);
         persistence.cron();
         replication.cron();
         if (cl != nullptr) {

@@ -191,6 +191,20 @@ size_t Store::active_expire_cycle(std::chrono::microseconds budget) {
     return total_expired;
 }
 
+bool Store::active_rehash(std::chrono::microseconds budget) {
+    auto deadline = std::chrono::steady_clock::now() + budget;
+    while (dict_.rehashing() || expires_.rehashing()) {
+        // 100 buckets between clock reads: a few microseconds of work, so
+        // the budget is overshot by at most that much.
+        dict_.rehash_step(100);
+        expires_.rehash_step(100);
+        if (std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+    }
+    return dict_.rehashing() || expires_.rehashing();
+}
+
 void Store::clear() {
     dict_ = HashTable<Entry>();
     expires_ = HashTable<int64_t>();

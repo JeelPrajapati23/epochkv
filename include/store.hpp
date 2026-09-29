@@ -80,6 +80,12 @@ public:
     // and the time budget allows. Returns how many keys were deleted.
     size_t active_expire_cycle(std::chrono::microseconds budget);
 
+    // Advances any in-progress hash table resize for up to `budget`. Writes
+    // move buckets too, but a read-only workload would otherwise leave a
+    // resize (and both bucket arrays) hanging indefinitely. Returns true if
+    // a resize is still in progress.
+    bool active_rehash(std::chrono::microseconds budget);
+
     void set_deletion_listener(DeletionListener listener) { deletion_listener_ = std::move(listener); }
 
     // Passive expiry (on for replicas): expired keys read as missing but are

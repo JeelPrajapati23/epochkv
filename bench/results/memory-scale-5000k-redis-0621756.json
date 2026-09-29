@@ -1,0 +1,111 @@
+{
+  "meta": {
+    "server": "redis",
+    "commit": "0621756",
+    "date": "2026-09-29 10:57:03",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    }
+  },
+  "result": {
+    "keys": 5000000,
+    "key_len": 12,
+    "value_size": 64,
+    "load": {
+      "seconds": 15.010401833000003,
+      "ops_per_sec": 333102.341671335,
+      "rss": 849895424,
+      "bytes_per_key": 166.961152
+    },
+    "bgsave": {
+      "seconds": 8.515086843999995,
+      "file_bytes": 135000097,
+      "overwrites_during": 873000,
+      "peak_cow_bytes": 125308928,
+      "peak_parent_plus_cow": 975220736
+    },
+    "full_resync": {
+      "seconds": 17.860744992000008,
+      "replica_rss": 849895424
+    },
+    "stalls": {
+      "load": {
+        "worst": 0.10513332199093384,
+        "episodes_over_10ms": 16,
+        "top": [
+          {
+            "at_keys": 655000,
+            "worst": 0.10513332199093384
+          },
+          {
+            "at_keys": 1372000,
+            "worst": 0.08933353498085239
+          },
+          {
+            "at_keys": 2132000,
+            "worst": 0.040974008970749765
+          },
+          {
+            "at_keys": 2721000,
+            "worst": 0.037835948960974974
+          },
+          {
+            "at_keys": 4198000,
+            "worst": 0.022721056942117457
+          },
+          {
+            "at_keys": 4194000,
+            "worst": 0.01965852994243278
+          },
+          {
+            "at_keys": 4199000,
+            "worst": 0.016962837942031683
+          },
+          {
+            "at_keys": 4196000,
+            "worst": 0.016450325942315658
+          }
+        ]
+      },
+      "bgsave": {
+        "worst": 0.013798710908559997,
+        "episodes_over_10ms": 2,
+        "top": [
+          {
+            "at_keys": 5000000,
+            "worst": 0.013798710908559997
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.010869246906395347
+          }
+        ]
+      },
+      "resync": {
+        "worst": 0.013114548837961593,
+        "episodes_over_10ms": 3,
+        "top": [
+          {
+            "at_keys": 5000000,
+            "worst": 0.013114548837961593
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.011529188863477202
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.011521899845547523
+          }
+        ]
+      }
+    },
+    "restart": {
+      "seconds": 6.869924172000026,
+      "rss": 854011904
+    }
+  }
+}
