@@ -85,6 +85,10 @@ private:
     void cmd_get(const Args& argv, std::string& out);
     void cmd_del(const Args& argv, std::string& out);
     void cmd_exists(const Args& argv, std::string& out);
+    void cmd_incr(const Args& argv, std::string& out);
+    void cmd_decr(const Args& argv, std::string& out);
+    void cmd_incrby(const Args& argv, std::string& out);
+    void cmd_decrby(const Args& argv, std::string& out);
     void cmd_expire(const Args& argv, std::string& out);
     void cmd_pexpire(const Args& argv, std::string& out);
     void cmd_expireat(const Args& argv, std::string& out);
@@ -113,6 +117,8 @@ private:
 
     // relative: the argument is a TTL (EXPIRE) rather than a timestamp (EXPIREAT).
     void expire_generic(const Args& argv, int64_t unit_ms, bool relative, const char* name, std::string& out);
+    // Shared body of INCR / DECR / INCRBY / DECRBY.
+    void incr_by(const std::string& key, int64_t delta, std::string& out);
 
     Store& store_;
     Propagator propagator_;

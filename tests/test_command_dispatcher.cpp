@@ -173,6 +173,77 @@ TEST_CASE("plain SET clears a TTL; SET KEEPTTL keeps it", "[dispatcher][ttl]") {
     REQUIRE(run(d, {"TTL", "k"}) == ":-1\r\n");
 }
 
+TEST_CASE("INCR / DECR / INCRBY / DECRBY treat a missing key as 0", "[dispatcher][incr]") {
+    Store store;
+    CommandDispatcher d(store);
+    REQUIRE(run(d, {"INCR", "a"}) == ":1\r\n");
+    REQUIRE(run(d, {"INCR", "a"}) == ":2\r\n");
+    REQUIRE(run(d, {"DECR", "b"}) == ":-1\r\n");
+    REQUIRE(run(d, {"INCRBY", "a", "10"}) == ":12\r\n");
+    REQUIRE(run(d, {"INCRBY", "a", "-20"}) == ":-8\r\n");
+    REQUIRE(run(d, {"DECRBY", "a", "2"}) == ":-10\r\n");
+    REQUIRE(run(d, {"GET", "a"}) == "$3\r\n-10\r\n");  // stored as a plain string
+
+    run(d, {"SET", "c", "41"});
+    REQUIRE(run(d, {"incr", "c"}) == ":42\r\n");
+}
+
+TEST_CASE("INCR rejects non-integer values and deltas without changing the key", "[dispatcher][incr]") {
+    Store store;
+    CommandDispatcher d(store);
+    const std::string not_integer = "-ERR value is not an integer or out of range\r\n";
+    for (const char* bad : {"hello", "", " 5", "5 ", "+5", "007", "-0", "1.5", "99999999999999999999"}) {
+        run(d, {"SET", "k", bad});
+        REQUIRE(run(d, {"INCR", "k"}) == not_integer);
+        REQUIRE(run(d, {"GET", "k"}) == run(d, {"ECHO", bad}));
+    }
+    run(d, {"SET", "n", "1"});
+    REQUIRE(run(d, {"INCRBY", "n", "abc"}) == not_integer);
+    REQUIRE(run(d, {"DECRBY", "n", "1.5"}) == not_integer);
+    REQUIRE(run(d, {"INCR", "n", "extra"}) == "-ERR wrong number of arguments for 'incr' command\r\n");
+    REQUIRE(run(d, {"GET", "n"}) == "$1\r\n1\r\n");
+}
+
+TEST_CASE("INCR overflow in either direction is an error and leaves the value alone", "[dispatcher][incr]") {
+    Store store;
+    CommandDispatcher d(store);
+    const std::string overflow = "-ERR increment or decrement would overflow\r\n";
+    run(d, {"SET", "max", "9223372036854775807"});
+    REQUIRE(run(d, {"INCR", "max"}) == overflow);
+    REQUIRE(run(d, {"GET", "max"}) == "$19\r\n9223372036854775807\r\n");
+
+    run(d, {"SET", "min", "-9223372036854775808"});
+    REQUIRE(run(d, {"DECR", "min"}) == overflow);
+    REQUIRE(run(d, {"INCRBY", "min", "-1"}) == overflow);
+    REQUIRE(run(d, {"INCRBY", "min", "9223372036854775807"}) == ":-1\r\n");
+
+    // -INT64_MIN has no int64 representation, even when the result would fit.
+    run(d, {"SET", "z", "-1"});
+    REQUIRE(run(d, {"DECRBY", "z", "-9223372036854775808"}) == "-ERR decrement would overflow\r\n");
+    REQUIRE(run(d, {"GET", "z"}) == "$2\r\n-1\r\n");
+}
+
+TEST_CASE("INCR keeps the key's TTL", "[dispatcher][incr][ttl]") {
+    ClockedStore cs;
+    CommandDispatcher d(cs.store);
+    run(d, {"SET", "k", "5", "EX", "100"});
+    REQUIRE(run(d, {"INCR", "k"}) == ":6\r\n");
+    REQUIRE(run(d, {"TTL", "k"}) == ":100\r\n");
+
+    // Once expired, the key is gone and INCR starts over from 0 with no TTL.
+    cs.now += 100'000;
+    REQUIRE(run(d, {"INCR", "k"}) == ":1\r\n");
+    REQUIRE(run(d, {"TTL", "k"}) == ":-1\r\n");
+}
+
+TEST_CASE("INCR over maxmemory with noeviction is refused with -OOM", "[dispatcher][incr][lru]") {
+    ClockedStore cs(/*maxmemory=*/200, EvictionPolicy::kNoEviction);
+    CommandDispatcher d(cs.store);
+    REQUIRE(run(d, {"SET", "a", std::string(300, 'x')}) == "+OK\r\n");
+    REQUIRE(run(d, {"INCR", "k"}) == "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    REQUIRE(run(d, {"GET", "k"}) == "$-1\r\n");
+}
+
 TEST_CASE("EXPIRE / PEXPIRE / PERSIST", "[dispatcher][ttl]") {
     ClockedStore cs;
     CommandDispatcher d(cs.store);
@@ -307,6 +378,27 @@ TEST_CASE("DEL is propagated only if it removed something; reads never are", "[d
     run(d, {"DEL", "missing"});
     run(d, {"DEL", "k", "missing"});
     REQUIRE(log.commands == std::vector<std::string>{"DEL k missing"});
+}
+
+TEST_CASE("INCR-family commands are propagated as SET <result> KEEPTTL; failures aren't", "[dispatcher][propagation][incr]") {
+    Store store;
+    CommandDispatcher d(store);
+    run(d, {"SET", "s", "text"});
+    PropagationLog log;
+    log.attach(d);
+
+    run(d, {"INCR", "a"});
+    run(d, {"INCRBY", "a", "9"});
+    run(d, {"DECR", "a"});
+    run(d, {"DECRBY", "a", "20"});
+    run(d, {"INCR", "s"});            // not an integer
+    run(d, {"INCRBY", "a", "x"});     // bad delta
+    REQUIRE(log.commands == std::vector<std::string>{
+                                "SET a 1 KEEPTTL",
+                                "SET a 10 KEEPTTL",
+                                "SET a 9 KEEPTTL",
+                                "SET a -11 KEEPTTL",
+                            });
 }
 
 TEST_CASE("EXPIREAT and SET EXAT use absolute times", "[dispatcher][ttl]") {

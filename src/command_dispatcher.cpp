@@ -16,6 +16,7 @@
 namespace {
 
 constexpr const char* kErrNotInteger = "ERR value is not an integer or out of range";
+constexpr const char* kErrIncrOverflow = "ERR increment or decrement would overflow";
 constexpr const char* kErrSyntax = "ERR syntax error";
 constexpr const char* kErrOom = "OOM command not allowed when used memory > 'maxmemory'.";
 constexpr const char* kErrNoPersistence = "ERR persistence is not enabled on this server";
@@ -53,6 +54,12 @@ bool parse_int64(const std::string& s, int64_t& out) {
     return ec == std::errc() && ptr == last && first != last;
 }
 
+// Like parse_int64, but also rejects non-canonical spellings ("007", "-0"),
+// as Redis does for INCR: only text that std::to_string would produce counts.
+bool parse_canonical_int64(const std::string& s, int64_t& out) {
+    return parse_int64(s, out) && std::to_string(out) == s;
+}
+
 // Absolute deadline = now + amount * unit_ms, or nullopt on int64 overflow.
 // A client can send any 64-bit count, so both steps are overflow-checked.
 std::optional<int64_t> deadline_from(int64_t now, int64_t amount, int64_t unit_ms) {
@@ -76,6 +83,10 @@ CommandDispatcher::CommandDispatcher(Store& store)
           {"GET", {"get", &CommandDispatcher::cmd_get, 2, 0, 1, 1, 1}},
           {"DEL", {"del", &CommandDispatcher::cmd_del, -2, kWrite, 1, -1, 1}},
           {"EXISTS", {"exists", &CommandDispatcher::cmd_exists, -2, 0, 1, -1, 1}},
+          {"INCR", {"incr", &CommandDispatcher::cmd_incr, 2, kWrite | kDenyOom, 1, 1, 1}},
+          {"DECR", {"decr", &CommandDispatcher::cmd_decr, 2, kWrite | kDenyOom, 1, 1, 1}},
+          {"INCRBY", {"incrby", &CommandDispatcher::cmd_incrby, 3, kWrite | kDenyOom, 1, 1, 1}},
+          {"DECRBY", {"decrby", &CommandDispatcher::cmd_decrby, 3, kWrite | kDenyOom, 1, 1, 1}},
           {"EXPIRE", {"expire", &CommandDispatcher::cmd_expire, 3, kWrite, 1, 1, 1}},
           {"PEXPIRE", {"pexpire", &CommandDispatcher::cmd_pexpire, 3, kWrite, 1, 1, 1}},
           {"EXPIREAT", {"expireat", &CommandDispatcher::cmd_expireat, 3, kWrite, 1, 1, 1}},
@@ -319,6 +330,60 @@ void CommandDispatcher::cmd_exists(const Args& argv, std::string& out) {
         }
     }
     reply::integer(out, found);
+}
+
+// INCR / DECR / INCRBY / DECRBY key [delta] — the value is parsed as a
+// signed 64-bit integer (a missing key counts as 0), `delta` is added, and
+// the new value is stored and returned. The TTL is kept. Propagated as
+// SET key <new value> KEEPTTL rather than as the command itself: the log
+// then records the result, so applying an entry twice can't double-count.
+void CommandDispatcher::incr_by(const std::string& key, int64_t delta, std::string& out) {
+    int64_t value = 0;
+    if (const std::string* current = store_.get(key)) {
+        if (!parse_canonical_int64(*current, value)) {
+            reply::error(out, kErrNotInteger);
+            return;
+        }
+    }
+    if (__builtin_add_overflow(value, delta, &value)) {
+        reply::error(out, kErrIncrOverflow);
+        return;
+    }
+    std::string text = std::to_string(value);
+    store_.set(key, text, /*keep_ttl=*/true);
+    propagate({"SET", key, std::move(text), "KEEPTTL"});
+    reply::integer(out, value);
+}
+
+void CommandDispatcher::cmd_incr(const Args& argv, std::string& out) {
+    incr_by(argv[1], 1, out);
+}
+
+void CommandDispatcher::cmd_decr(const Args& argv, std::string& out) {
+    incr_by(argv[1], -1, out);
+}
+
+void CommandDispatcher::cmd_incrby(const Args& argv, std::string& out) {
+    int64_t delta;
+    if (!parse_int64(argv[2], delta)) {
+        reply::error(out, kErrNotInteger);
+        return;
+    }
+    incr_by(argv[1], delta, out);
+}
+
+void CommandDispatcher::cmd_decrby(const Args& argv, std::string& out) {
+    int64_t delta;
+    if (!parse_int64(argv[2], delta)) {
+        reply::error(out, kErrNotInteger);
+        return;
+    }
+    // -INT64_MIN doesn't fit in an int64.
+    if (delta == INT64_MIN) {
+        reply::error(out, "ERR decrement would overflow");
+        return;
+    }
+    incr_by(argv[1], -delta, out);
 }
 
 // EXPIRE key seconds / PEXPIRE key ms / EXPIREAT key unix-seconds /
