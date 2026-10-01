@@ -14,14 +14,16 @@ A 3-master, 3-replica cluster takes writes through the Python client while one m
 
 **Headline numbers** (i7-13650HX, WSL2, loopback, 80/20 GET/SET, 64-byte values; see [Benchmarks](#benchmarks)):
 
-| | ops/s | p99 |
+| 1 node, ops/s (median of 3) | EpochKV | Redis 8.0.5 |
 |---|---|---|
-| 1 node, 16 clients, no pipelining | 50.6k | 639µs |
-| Redis 8.0.5, same harness and load | 48.4k | — |
-| 1 node, 12 clients × 64-deep pipelines (Python client) | **895k** | 1.25ms |
-| 3-node cluster, 12 clients × 64-deep pipelines | **1.23M** | 983µs |
+| 16 clients, no pipelining | 51.1k | 49.4k |
+| 12 clients × 64-deep pipelines (Python client) | **1.00M** | 1.00M |
+| `redis-benchmark`, 16 clients × 64, GET | 1.20M | 1.31M |
+| `redis-benchmark`, 16 clients × 64, SET | 762k | **1.12M** |
 
-Without pipelining, throughput is within ~10% of Redis 8 under both our harness and `redis-benchmark`, and in both servers most CPU time goes to the kernel. Pipelining is 17× faster on one node because it removes a wakeup per request, which measurement showed to be the main cost.
+A 3-node cluster reached **1.23M** ops/s with 12 clients × 64-deep pipelines (Python client, p99 983µs). That number is limited by the load generator, so it's a lower bound.
+
+Pipelining is about 20× faster on one node because it removes a wakeup per request, which measurement showed to be the main cost. Under our harness (80/20 GET/SET), EpochKV matches Redis with and without pipelining. Under `redis-benchmark` at depth 64, GET is within ~9%, but **Redis is ~1.5× faster on SET**: with the kernel's per-message cost spread over the batch, our own write path becomes the bottleneck. Likely causes, not yet profiled: every SET is encoded into the replication backlog even with no replicas, the value is copied one extra time, and each new key allocates a second copy of the key for the LRU list.
 
 ## Architecture
 
@@ -171,6 +173,7 @@ python3 bench/bench.py run --clients 16 --pipeline 16             # one closed-l
 python3 bench/bench.py run --clients 16 --rate 40000              # open loop: honest tail latency at 40k ops/s
 python3 bench/bench.py run --client kvclient --clients 12 --pipeline 16 --nodes 3   # real client, 3-master cluster
 python3 bench/bench.py crosscheck                                 # same load via redis-benchmark (needs redis-tools)
+python3 bench/bench.py crosscheck --pipeline 64                   # ... with 64-deep pipelines (redis-benchmark -P)
 ```
 
 ## Tests

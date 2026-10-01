@@ -14,9 +14,10 @@
   bench.py baseline [--server kv|redis]
       The baseline matrix: closed loop at 1/4/16/64 clients, median of 3
       runs each, written to bench/results/.
-  bench.py crosscheck
+  bench.py crosscheck [--pipeline P]
       The same client counts through redis-benchmark (a C load generator),
-      to check the Python harness isn't what's being measured.
+      to check the Python harness isn't what's being measured. --pipeline
+      is passed through as redis-benchmark's -P.
 
 Linux only (sched_setaffinity, /proc). Runs the Release build.
 """
@@ -539,19 +540,21 @@ def cmd_crosscheck(args):
         for clients in args.client_counts:
             cmd = ["taskset", "-c", ",".join(map(str, client_cpus)), "redis-benchmark", "-p", str(server.port),
                    "-c", str(clients), "-n", str(args.requests), "-t", "get,set", "-d", str(args.value_size),
-                   "-r", str(args.keys), "-P", "1", "--csv"]
+                   "-r", str(args.keys), "-P", str(args.pipeline), "--csv"]
             out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
             for line in out.strip().splitlines()[1:]:
                 f = [x.strip('"') for x in line.split(",")]
-                run_ = {"clients": clients, "test": f[0], "ops_per_sec": round(float(f[1])),
+                run_ = {"clients": clients, "pipeline": args.pipeline, "test": f[0], "ops_per_sec": round(float(f[1])),
                         "latency_ms": dict(zip(["avg", "min", "p50", "p95", "p99", "max"], map(float, f[2:8])))}
-                print("%4d clients  %-4s %9s ops/s   p50 %.3fms  p99 %.3fms" % (
-                    clients, f[0], "{:,}".format(run_["ops_per_sec"]), run_["latency_ms"]["p50"],
+                print("%4d clients x%-3d %-4s %9s ops/s   p50 %.3fms  p99 %.3fms" % (
+                    clients, args.pipeline, f[0], "{:,}".format(run_["ops_per_sec"]), run_["latency_ms"]["p50"],
                     run_["latency_ms"]["p99"]))
                 runs.append(run_)
     finally:
         server.stop()
-    save("crosscheck", {"meta": meta(args), "tool": "redis-benchmark", "runs": runs})
+    # Depth 1 keeps the original file name, so earlier results stay comparable.
+    name = "crosscheck" if args.pipeline == 1 else "crosscheck-p%d" % args.pipeline
+    save(name, {"meta": meta(args), "tool": "redis-benchmark", "runs": runs})
 
 
 def main():
@@ -580,6 +583,7 @@ def main():
             s.add_argument("--repeats", type=int, default=3)
         if name == "crosscheck":
             s.add_argument("--requests", type=int, default=1000000)
+            s.add_argument("--pipeline", type=int, default=1, help="requests per batch (redis-benchmark -P)")
     args = p.parse_args()
     {"run": cmd_run, "baseline": cmd_baseline, "crosscheck": cmd_crosscheck}[args.cmd](args)
 

@@ -1,0 +1,75 @@
+{
+  "meta": {
+    "server": "kv",
+    "commit": "fdb84e4",
+    "date": "2026-10-01 18:29:07",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "keys": 100000,
+    "value_size": 64,
+    "read_ratio": 0.8
+  },
+  "tool": "redis-benchmark",
+  "runs": [
+    {
+      "clients": 16,
+      "pipeline": 16,
+      "test": "SET",
+      "ops_per_sec": 642756,
+      "latency_ms": {
+        "avg": 0.37,
+        "min": 0.064,
+        "p50": 0.359,
+        "p95": 0.455,
+        "p99": 0.607,
+        "max": 5.191
+      }
+    },
+    {
+      "clients": 16,
+      "pipeline": 16,
+      "test": "GET",
+      "ops_per_sec": 908265,
+      "latency_ms": {
+        "avg": 0.254,
+        "min": 0.056,
+        "p50": 0.255,
+        "p95": 0.319,
+        "p99": 0.407,
+        "max": 4.943
+      }
+    },
+    {
+      "clients": 64,
+      "pipeline": 16,
+      "test": "SET",
+      "ops_per_sec": 712048,
+      "latency_ms": {
+        "avg": 1.343,
+        "min": 0.248,
+        "p50": 1.367,
+        "p95": 1.567,
+        "p99": 1.735,
+        "max": 3.487
+      }
+    },
+    {
+      "clients": 64,
+      "pipeline": 16,
+      "test": "GET",
+      "ops_per_sec": 1005834,
+      "latency_ms": {
+        "avg": 0.927,
+        "min": 0.272,
+        "p50": 0.975,
+        "p95": 1.095,
+        "p99": 1.191,
+        "max": 2.111
+      }
+    }
+  ]
+}
