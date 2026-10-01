@@ -32,6 +32,11 @@ public:
     // attached to us can exist.
     void set_replication(Replication* replication) { replication_ = replication; }
 
+    // Connections beyond this many are accepted, sent an error, and closed
+    // (Redis's maxclients). Keeping it below the open-file limit means
+    // accept() doesn't run out of fds.
+    void set_maxclients(size_t maxclients) { maxclients_ = maxclients; }
+
     // Creates the listening socket, epoll instance and signalfd. Returns
     // false (after logging the failing syscall) if any setup step fails.
     bool start();
@@ -45,6 +50,16 @@ public:
     // AOF flush lives here: a reply must never leave before the write it
     // acknowledges has been handed to the AOF.
     void set_before_sleep(std::function<void()> hook);
+
+    // Calls `handler` with the gap whenever the loop resumes more than
+    // `threshold` after its previous wakeup, before that iteration handles
+    // any event. With a cron set, epoll_wait never sleeps longer than one
+    // tick, so a gap that long means the process was frozen (SIGSTOP, a
+    // stalled VM) or an iteration ran very long: everything it believed
+    // about the outside world is that old, and the commands that queued up
+    // meanwhile shouldn't be served on those beliefs. Needs a cron.
+    void set_stall_handler(std::chrono::milliseconds threshold,
+                           std::function<void(std::chrono::milliseconds gap)> handler);
 
     // Runs the event loop until SIGINT/SIGTERM arrives.
     void run();
@@ -90,7 +105,10 @@ private:
     std::function<void()> cron_task_;
     std::chrono::steady_clock::time_point next_cron_;
     std::function<void()> before_sleep_;
+    std::chrono::milliseconds stall_threshold_{0};
+    std::function<void(std::chrono::milliseconds)> stall_handler_;
 
+    size_t maxclients_ = 10000;
     uint64_t next_client_id_ = 1;
     std::unordered_map<int, std::unique_ptr<Client>> conns_;
     std::unordered_map<int, std::function<void()>> watchers_;

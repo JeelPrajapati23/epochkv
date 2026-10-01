@@ -427,6 +427,25 @@ void Cluster::update_state() {
     state_ok_ = ok;
 }
 
+// A master that was frozen (SIGSTOP, a stalled VM) wakes up to find client
+// commands queued in its sockets, and in the first iteration it would serve
+// them as the owner of its slots, although the others may have promoted its
+// replica meanwhile. Any write it accepted then is lost when it learns that
+// and resyncs as a replica. Failure detection can't catch this in time: a
+// peer whose PONG arrived just before the freeze has no PING outstanding,
+// so it would only be flagged a node timeout after waking. Treating the
+// stall like a stay on the minority side makes update_state()'s rejoin
+// delay keep us refusing until fresh gossip has had a chance to arrive.
+void Cluster::after_stall(std::chrono::milliseconds gap) {
+    std::cout << "cluster: the event loop stalled for " << gap.count()
+              << "ms; refusing commands until the cluster view is refreshed\n";
+    among_minority_time_ = now();
+    if (state_ok_) {
+        std::cout << "cluster state changed: fail\n";
+        state_ok_ = false;
+    }
+}
+
 // --- routing ------------------------------------------------------------------
 
 bool Cluster::route(const std::vector<const std::string*>& keys, bool write, bool asking, const Client& c,

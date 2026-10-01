@@ -1,3 +1,6 @@
+#include <sys/resource.h>
+
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -33,6 +36,13 @@ constexpr std::chrono::microseconds kActiveExpireBudget{25'000};
 // Redis's activerehashing.
 constexpr std::chrono::microseconds kActiveRehashBudget{1'000};
 
+// Redis's default maxclients.
+constexpr size_t kDefaultMaxClients = 10000;
+// fds the server needs besides its clients: listening socket, epoll,
+// signalfd, AOF and snapshot files, the replication link, and one or two
+// links per cluster peer.
+constexpr size_t kReservedFds = 128;
+
 void usage(const char* prog) {
     std::cerr << "usage: " << prog
               << " [--bind ADDR] [--port PORT] [--maxmemory BYTES[kb|mb|gb]]"
@@ -43,7 +53,43 @@ void usage(const char* prog) {
                  "       [--replicaof HOST PORT] [--repl-backlog-size BYTES] [--repl-timeout SECONDS]\n"
                  "       [--cluster-enabled yes|no] [--cluster-config-file NAME] [--cluster-port PORT]\n"
                  "       [--cluster-node-timeout MS] [--cluster-require-full-coverage yes|no]\n"
-                 "       [--cluster-replica-validity-factor N] [--cluster-replica-no-failover yes|no]\n";
+                 "       [--cluster-replica-validity-factor N] [--cluster-replica-no-failover yes|no]\n"
+                 "       [--maxclients N]\n";
+}
+
+// Raises the soft open-file limit to fit `maxclients` plus kReservedFds
+// (Redis's adjustOpenFilesLimit). Only the hard limit needs root, so this
+// usually just works. If the hard limit is too low, lowers maxclients to fit
+// rather than refusing to start. Returns the maxclients to use, or 0 if
+// the limit can't even cover the reserved fds.
+size_t adjust_open_files_limit(size_t maxclients) {
+    rlimit limit{};
+    if (getrlimit(RLIMIT_NOFILE, &limit) < 0) {
+        std::perror("getrlimit(RLIMIT_NOFILE)");
+        return maxclients;  // can't tell; accept() will report EMFILE if it comes to that
+    }
+    rlim_t wanted = maxclients + kReservedFds;
+    if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur >= wanted) {
+        return maxclients;
+    }
+    rlim_t old = limit.rlim_cur;
+    limit.rlim_cur = limit.rlim_max == RLIM_INFINITY ? wanted : std::min(wanted, limit.rlim_max);
+    if (setrlimit(RLIMIT_NOFILE, &limit) < 0) {
+        std::perror("setrlimit(RLIMIT_NOFILE)");
+        limit.rlim_cur = old;
+    }
+    if (limit.rlim_cur >= wanted) {
+        return maxclients;
+    }
+    if (limit.rlim_cur <= kReservedFds) {
+        std::cerr << "fatal: the open-file limit (" << limit.rlim_cur << ") is too low to start; "
+                  << "raise it with 'ulimit -n'\n";
+        return 0;
+    }
+    size_t lowered = limit.rlim_cur - kReservedFds;
+    std::cerr << "warning: maxclients lowered from " << maxclients << " to " << lowered
+              << ": the open-file limit is " << limit.rlim_cur << " (raise it with 'ulimit -n')\n";
+    return lowered;
 }
 
 // "3600 1 300 100" -> {{3600, 1}, {300, 100}}; "" -> no save points.
@@ -115,6 +161,7 @@ int main(int argc, char** argv) {
     Cluster::Options cluster_options;
     std::string cluster_config_file = "nodes.conf";
     std::optional<uint16_t> cluster_port;
+    size_t maxclients = kDefaultMaxClients;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -261,10 +308,24 @@ int main(int argc, char** argv) {
                 return 1;
             }
             cluster_options.node_timeout = std::chrono::milliseconds(value);
+        } else if (arg == "--maxclients" && has_value) {
+            char* end = nullptr;
+            long value = std::strtol(argv[++i], &end, 10);
+            if (*end != '\0' || value <= 0 || value > 10'000'000) {
+                std::cerr << "invalid maxclients: " << argv[i] << "\n";
+                return 1;
+            }
+            maxclients = static_cast<size_t>(value);
         } else {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    // Before anything opens files, so a too-low limit is reported up front.
+    maxclients = adjust_open_files_limit(maxclients);
+    if (maxclients == 0) {
+        return 1;
     }
 
     if (cluster_enabled && replicaof) {
@@ -337,8 +398,15 @@ int main(int argc, char** argv) {
 
     Server server(bind_addr, port, dispatcher);
     server.set_replication(&replication);
+    server.set_maxclients(maxclients);
     replication.attach(&server);
     Cluster* cl = cluster.get();
+    // Half a node timeout without running is long enough that the others
+    // may be failing us over by now. A healthy loop wakes every cron tick.
+    if (cl != nullptr) {
+        server.set_stall_handler(cluster_options.node_timeout / 2,
+                                 [cl](std::chrono::milliseconds gap) { cl->after_stall(gap); });
+    }
     server.set_cron(kCronInterval, [&store, &persistence, &replication, cl] {
         store.active_expire_cycle(kActiveExpireBudget);  // a no-op on a replica
         store.active_rehash(kActiveRehashBudget);

@@ -6,6 +6,7 @@ Usage: python3 tests/integration/test_server.py [path/to/kv_server]
 
 import glob
 import os
+import resource
 import shutil
 import signal
 import socket
@@ -99,13 +100,19 @@ class ServerTest(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="kv_store_it_")
         self.start_server()
 
-    def start_server(self, *extra_args):
-        """(Re)starts the server with extra command-line flags."""
+    def start_server(self, *extra_args, open_files=None):
+        """(Re)starts the server with extra command-line flags, and optionally
+        a lower open-file limit (soft and hard, like `ulimit -n`)."""
         self.stop_server()
         self.port = free_port()
+
+        def limit_files():
+            resource.setrlimit(resource.RLIMIT_NOFILE, (open_files, open_files))
+
         self.proc = subprocess.Popen(
             [SERVER_BIN, "--port", str(self.port), "--dir", self.dir, *extra_args],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            preexec_fn=limit_files if open_files else None)
         deadline = time.time() + 5
         while True:
             try:
@@ -253,6 +260,63 @@ class ServerTest(unittest.TestCase):
         self.client()
         self.proc.send_signal(signal.SIGTERM)
         self.assertEqual(self.proc.wait(timeout=5), 0)
+
+    # --- maxclients --------------------------------------------------------
+
+    def connect_served(self, n):
+        """n clients, connected one at a time, each answering a PING. One at a
+        time, so start_server()'s readiness probe is closed by the time a
+        later client is counted."""
+        clients = []
+        for _ in range(n):
+            c = self.client()
+            self.assertEqual(c.cmd("PING"), "PONG")
+            clients.append(c)
+        return clients
+
+    def assert_refused(self):
+        c = Client(self.port)
+        try:
+            reply = c.read_reply()  # sent unprompted, right after accept
+            self.assertIsInstance(reply, RuntimeError)
+            self.assertEqual(str(reply), "ERR max number of clients reached")
+            self.assertTrue(c.is_closed())
+        finally:
+            c.close()
+
+    def test_maxclients_refuses_extra_connections_with_an_error(self):
+        self.start_server("--maxclients", "5")
+        clients = self.connect_served(5)
+        self.assert_refused()
+        self.assertEqual(clients[1].cmd("PING"), "PONG")  # the others are unaffected
+
+        # Once the server has processed a close, the slot is free again.
+        clients[0].close()
+
+        def accepted():
+            c = Client(self.port)
+            try:
+                return c.cmd("PING") == "PONG"
+            except OSError:
+                return False
+            finally:
+                c.close()
+        self.wait_until(accepted)
+
+    def test_maxclients_is_lowered_to_fit_the_open_file_limit(self):
+        # 200 fds, 128 of them reserved for the server's own: room for 72.
+        self.start_server("--maxclients", "1000", open_files=200)
+        self.connect_served(72)
+        self.assert_refused()
+
+    def test_open_file_limit_below_the_reserve_refuses_to_start(self):
+        proc = subprocess.Popen(
+            [SERVER_BIN, "--port", str(free_port()), "--dir", self.dir],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (100, 100)))
+        _, err = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"too low to start", err)
 
     # --- persistence -------------------------------------------------------
 

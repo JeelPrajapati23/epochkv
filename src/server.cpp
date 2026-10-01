@@ -123,6 +123,12 @@ void Server::set_before_sleep(std::function<void()> hook) {
     before_sleep_ = std::move(hook);
 }
 
+void Server::set_stall_handler(std::chrono::milliseconds threshold,
+                               std::function<void(std::chrono::milliseconds gap)> handler) {
+    stall_threshold_ = threshold;
+    stall_handler_ = std::move(handler);
+}
+
 // How long epoll_wait may sleep: until the next cron tick, or forever if
 // there's no cron. This is how timers live inside an event loop without a
 // separate thread — the wait itself is the timer.
@@ -155,6 +161,7 @@ void Server::run_cron_if_due() {
 void Server::run() {
     std::vector<epoll_event> events(kMaxEventsPerWait);
     bool running = true;
+    auto last_wakeup = std::chrono::steady_clock::now();
 
     while (running) {
         int n = epoll_wait(epoll_fd_, events.data(), kMaxEventsPerWait, cron_timeout_ms());
@@ -165,6 +172,13 @@ void Server::run() {
             std::perror("epoll_wait");
             break;
         }
+        // Before any event: the commands that queued up during a freeze
+        // are exactly the ones that mustn't run on stale beliefs.
+        auto woke = std::chrono::steady_clock::now();
+        if (stall_handler_ && cron_task_ && woke - last_wakeup > stall_threshold_) {
+            stall_handler_(std::chrono::duration_cast<std::chrono::milliseconds>(woke - last_wakeup));
+        }
+        last_wakeup = woke;
 
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
@@ -242,12 +256,23 @@ void Server::accept_clients() {
                 continue;
             }
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                // e.g. EMFILE (out of fds). Known limitation: the pending
-                // connection stays queued, so level-triggered epoll will keep
-                // waking us until an fd frees up.
+                // e.g. EMFILE (out of fds). The pending connection stays
+                // queued, so level-triggered epoll keeps waking us until an
+                // fd frees up. maxclients is what keeps this from happening:
+                // the fd limit is raised above it at startup.
                 std::perror("accept4");
             }
             return;
+        }
+
+        // Full: accept anyway, so the client gets a clear error instead of
+        // hanging in the listen queue. Closing right away is safe: this fd
+        // was never in epoll, so no stale event can refer to it.
+        if (conns_.size() >= maxclients_) {
+            static const char kErr[] = "-ERR max number of clients reached\r\n";
+            send(fd, kErr, sizeof(kErr) - 1, MSG_NOSIGNAL);
+            close(fd);
+            continue;
         }
 
         // Disable Nagle's algorithm: replies are small and latency-sensitive,

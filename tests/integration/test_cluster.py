@@ -413,6 +413,53 @@ class ClusterTest(unittest.TestCase):
 
     # --- failover -------------------------------------------------------------
 
+    def freeze_and_queue_write(self, node, key):
+        """SIGSTOPs `node` and returns a socket with a SET to `key` sent while
+        it's frozen: queued by its kernel, unread until it wakes."""
+        s = socket.create_connection(node.addr, timeout=10)
+        s.sendall(test_server.encode("PING"))
+        self.assertEqual(s.recv(64), b"+PONG\r\n")
+        node.proc.send_signal(signal.SIGSTOP)
+        return s
+
+    def test_frozen_master_refuses_writes_queued_while_it_was_replaced(self):
+        m1, m2, m3, r1, r2, r3 = self.cluster(3, replicas=1)
+        r1_id = r1.myid()
+        m1_slots = sorted(m1.me()["slots"])
+        key = keys_in_slots(set(m1_slots), 1, prefix="stale")[0]
+
+        s = self.freeze_and_queue_write(m1, key)
+        try:
+            survivors = [m2, m3, r1, r2, r3]
+            wait_until(lambda: all(n.owner_of(m1_slots[0]) == r1_id for n in survivors), 30, "r1 taking over")
+            # Queued now; m1 reads it the moment it wakes, before anything
+            # on the cluster bus could tell it it was replaced.
+            s.sendall(test_server.encode("SET", key, "stale"))
+        finally:
+            m1.proc.send_signal(signal.SIGCONT)
+        reply = s.recv(256)
+        s.close()
+        self.assertTrue(reply.startswith((b"-CLUSTERDOWN", b"-MOVED")), reply)
+        wait_until(lambda: m1.me()["master"] == r1_id, 20, "the old master becoming r1's replica")
+        client = ClusterClient(m2.addr)
+        self.assertIsNone(client.call("GET", key))
+        client.close()
+
+    def test_briefly_frozen_master_refuses_then_serves_again(self):
+        # Frozen for longer than half the node timeout, but too briefly for
+        # a failover: it can't know that, so it refuses for the rejoin delay
+        # (the node timeout, 2s here), then serves its slots again.
+        m1, m2, m3 = self.cluster(3)
+        key = keys_in_slots(set(m1.me()["slots"]), 1, prefix="brief")[0]
+        s = self.freeze_and_queue_write(m1, key)
+        time.sleep(1.3)
+        s.sendall(test_server.encode("SET", key, "v"))
+        m1.proc.send_signal(signal.SIGCONT)
+        self.assertTrue(s.recv(256).startswith(b"-CLUSTERDOWN"))
+        s.close()
+        self.assertIn("master", m1.me()["flags"])  # nobody replaced it
+        wait_until(lambda: m1.call("SET", key, "v") == "OK", 10, "m1 serving again")
+
     def test_automatic_failover_then_old_master_rejoins_as_replica(self):
         m1, m2, m3, r1, r2, r3 = self.cluster(3, replicas=1)
         m1_id, r1_id = m1.myid(), r1.myid()

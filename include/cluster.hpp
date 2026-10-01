@@ -121,6 +121,11 @@ public:
     // Event-loop hooks.
     void cron();
     void before_sleep();
+    // The event loop didn't run for `gap`, long enough for the others to
+    // have started failing us over. Refuses key commands, as on the
+    // minority side of a partition, until gossip has had time to correct
+    // our view (the usual rejoin delay).
+    void after_stall(std::chrono::milliseconds gap);
 
     const std::string& myid() const;
     bool state_ok() const { return state_ok_; }
