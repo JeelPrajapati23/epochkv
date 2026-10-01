@@ -1,0 +1,187 @@
+{
+  "meta": {
+    "server": "redis",
+    "commit": "6c42315-dirty",
+    "date": "2026-10-01 19:39:00",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "keys": 100000,
+    "value_size": 64,
+    "read_ratio": 0.8
+  },
+  "alive_at_end": 10000,
+  "runs": [
+    {
+      "idle": 0,
+      "open_seconds": 0.0,
+      "server_rss_mb": 29.5,
+      "rss_bytes_per_conn": null,
+      "kernel_slab_bytes_per_conn": null,
+      "load": {
+        "config": {
+          "clients": 16,
+          "workers": 16,
+          "duration": 10,
+          "warmup": 2,
+          "keys": 100000,
+          "value_size": 64,
+          "read_ratio": 0.8,
+          "pipeline": 1,
+          "rate": 20000,
+          "client": "raw",
+          "nodes": 1
+        },
+        "ops_per_sec": 20000,
+        "latency_us": {
+          "mean": 182.4,
+          "p50": 167.9,
+          "p90": 217.1,
+          "p99": 442.4,
+          "p99.9": 1998.8,
+          "max": 4779.8
+        },
+        "server_cpu_pct": 59.0,
+        "server_user_pct": 5.2,
+        "server_sys_pct": 53.8,
+        "server_sleeps_per_op": 0.429,
+        "client_cpu_pct_max": 9.6,
+        "errors": 0,
+        "client_sleeps_per_op": 1.97,
+        "send_lag_us": {
+          "p99": 167.9,
+          "max": 3890.5
+        }
+      }
+    },
+    {
+      "idle": 1000,
+      "open_seconds": 0.212,
+      "server_rss_mb": 34.9,
+      "rss_bytes_per_conn": 5710,
+      "kernel_slab_bytes_per_conn": 6894,
+      "load": {
+        "config": {
+          "clients": 16,
+          "workers": 16,
+          "duration": 10,
+          "warmup": 2,
+          "keys": 100000,
+          "value_size": 64,
+          "read_ratio": 0.8,
+          "pipeline": 1,
+          "rate": 20000,
+          "client": "raw",
+          "nodes": 1
+        },
+        "ops_per_sec": 20000,
+        "latency_us": {
+          "mean": 214.5,
+          "p50": 172.0,
+          "p90": 237.6,
+          "p99": 426.0,
+          "p99.9": 14417.9,
+          "max": 24735.6
+        },
+        "server_cpu_pct": 56.5,
+        "server_user_pct": 13.9,
+        "server_sys_pct": 42.6,
+        "server_sleeps_per_op": 0.322,
+        "client_cpu_pct_max": 10.2,
+        "errors": 0,
+        "client_sleeps_per_op": 1.975,
+        "send_lag_us": {
+          "p99": 204.8,
+          "max": 18689.5
+        }
+      }
+    },
+    {
+      "idle": 5000,
+      "open_seconds": 0.499,
+      "server_rss_mb": 53.6,
+      "rss_bytes_per_conn": 4887,
+      "kernel_slab_bytes_per_conn": 8113,
+      "load": {
+        "config": {
+          "clients": 16,
+          "workers": 16,
+          "duration": 10,
+          "warmup": 2,
+          "keys": 100000,
+          "value_size": 64,
+          "read_ratio": 0.8,
+          "pipeline": 1,
+          "rate": 20000,
+          "client": "raw",
+          "nodes": 1
+        },
+        "ops_per_sec": 20000,
+        "latency_us": {
+          "mean": 177.3,
+          "p50": 172.0,
+          "p90": 217.1,
+          "p99": 352.3,
+          "p99.9": 802.8,
+          "max": 2649.5
+        },
+        "server_cpu_pct": 57.2,
+        "server_user_pct": 9.7,
+        "server_sys_pct": 47.5,
+        "server_sleeps_per_op": 0.408,
+        "client_cpu_pct_max": 10.0,
+        "errors": 0,
+        "client_sleeps_per_op": 1.979,
+        "send_lag_us": {
+          "p99": 167.9,
+          "max": 1611.4
+        }
+      }
+    },
+    {
+      "idle": 10000,
+      "open_seconds": 0.566,
+      "server_rss_mb": 65.3,
+      "rss_bytes_per_conn": 2471,
+      "kernel_slab_bytes_per_conn": 8290,
+      "load": {
+        "config": {
+          "clients": 16,
+          "workers": 16,
+          "duration": 10,
+          "warmup": 2,
+          "keys": 100000,
+          "value_size": 64,
+          "read_ratio": 0.8,
+          "pipeline": 1,
+          "rate": 20000,
+          "client": "raw",
+          "nodes": 1
+        },
+        "ops_per_sec": 20000,
+        "latency_us": {
+          "mean": 185.0,
+          "p50": 172.0,
+          "p90": 221.2,
+          "p99": 442.4,
+          "p99.9": 1540.1,
+          "max": 3874.4
+        },
+        "server_cpu_pct": 59.0,
+        "server_user_pct": 10.1,
+        "server_sys_pct": 48.9,
+        "server_sleeps_per_op": 0.377,
+        "client_cpu_pct_max": 10.1,
+        "errors": 0,
+        "client_sleeps_per_op": 1.99,
+        "send_lag_us": {
+          "p99": 159.7,
+          "max": 2044.5
+        }
+      }
+    }
+  ]
+}

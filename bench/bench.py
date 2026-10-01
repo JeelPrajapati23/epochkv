@@ -10,7 +10,9 @@
       stalls show up in full (no coordinated omission).
       --client kvclient drives the load through the real Python client
       (python-client/kvclient) instead of pre-encoded bytes, one client per
-      process, and --nodes N runs an N-master cluster.
+      process, and --nodes N runs an N-master cluster. --target HOST:PORT
+      benchmarks a server that's already running elsewhere (another
+      container or machine); its CPU use isn't reported then.
   bench.py baseline [--server kv|redis]
       The baseline matrix: closed loop at 1/4/16/64 clients, median of 3
       runs each, written to bench/results/.
@@ -126,7 +128,9 @@ class Server:
     """A server process pinned to its own CPU, with persistence off so the
     baseline measures the request path only."""
 
-    def __init__(self, kind, cpus, port=None, cluster=False):
+    host = "127.0.0.1"
+
+    def __init__(self, kind, cpus, port=None, cluster=False, extra=()):
         self.kind = kind
         self.port = port or free_port()
         self.dir = tempfile.mkdtemp(prefix="kvbench-")
@@ -145,6 +149,7 @@ class Server:
                    "--appendonly", "no", "--protected-mode", "no", "--daemonize", "no"]
         else:
             raise ValueError(kind)
+        cmd += list(extra)
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.sched_setaffinity(self.proc.pid, cpus)
         deadline = time.time() + 10
@@ -178,6 +183,21 @@ def start_servers(kind, server_cpus):
     return servers
 
 
+class Remote:
+    """A server someone else runs (--target): in another container, or on
+    another machine. Not ours to start or stop, and its CPU use isn't
+    visible from here."""
+
+    proc = None
+
+    def __init__(self, addr):
+        host, _, port = addr.rpartition(":")
+        self.host, self.port = host, int(port)
+
+    def stop(self):
+        pass
+
+
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -186,7 +206,7 @@ def free_port():
 
 def preload(servers, keys, value_size):
     """Creates every key once, so GETs hit and memory is in steady state."""
-    client = ClusterClient(("127.0.0.1", servers[0].port))
+    client = ClusterClient((servers[0].host, servers[0].port))
     value = b"x" * value_size
     pipe = client.pipeline()
     for i in range(keys):
@@ -236,25 +256,30 @@ class Link:
     each outstanding request counts from: when it was sent (closed loop) or
     when it was scheduled (open loop). Replies come back in the same order."""
 
-    def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port))
+    def __init__(self, addr):
+        self.sock = socket.create_connection(addr)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.buf = bytearray()
         self.inflight = collections.deque()
         self.next_due = 0
 
 
-def worker(cfg, port, n_links, seed, cpus, barrier, results):
+def worker(cfg, addr, n_links, seed, cpus, barrier, results):
     os.sched_setaffinity(0, cpus)
     pool = request_pool(cfg, seed)
     pool_i = 0
-    links = [Link(port) for _ in range(n_links)]
-    sel = selectors.DefaultSelector()
+    links = [Link(addr) for _ in range(n_links)]
+    pipeline, rate = cfg["pipeline"], cfg["rate"]
+    # Open loop sleeps until the next request is due, often for less than a
+    # millisecond. epoll's timeout has millisecond resolution (Python rounds
+    # it up), so it would send requests up to 1ms late, and that lateness
+    # counts as latency. select() takes microseconds, and a worker only
+    # watches a few sockets, so its O(n) scan doesn't matter.
+    sel = selectors.SelectSelector() if rate else selectors.DefaultSelector()
     for link in links:
         sel.register(link.sock, selectors.EVENT_READ, link)
     hist, lag = Histogram(), Histogram()
     ops = errors = 0
-    pipeline, rate = cfg["pipeline"], cfg["rate"]
     interval = cfg["clients"] * 1e9 / rate if rate else 0  # ns between one link's requests
     now_ns = time.perf_counter_ns
 
@@ -338,13 +363,13 @@ def worker(cfg, port, n_links, seed, cpus, barrier, results):
                  "sleeps": sleeps(os.getpid()) - sleeps_at_start})
 
 
-def client_worker(cfg, port, _n_links, seed, cpus, barrier, results):
+def client_worker(cfg, addr, _n_links, seed, cpus, barrier, results):
     """Closed loop through the real client: build a pipeline of `pipeline`
     commands, execute it, repeat. Latency runs from building the batch to
     having its results, so the client's own encoding and parsing count, as
     they would for an application."""
     os.sched_setaffinity(0, cpus)
-    client = ClusterClient(("127.0.0.1", port))
+    client = ClusterClient(addr)
     rng = random.Random(seed)
     value = b"x" * cfg["value_size"]
     pool = []
@@ -409,18 +434,23 @@ def run(cfg, servers, client_cpus):
         # Spread the connections as evenly as possible over the workers.
         n = cfg["clients"] // workers + (1 if w < cfg["clients"] % workers else 0)
         cpu = {client_cpus[w % len(client_cpus)]}
-        p = ctx.Process(target=target, args=(cfg, servers[0].port, n, 1000 + w, cpu, barrier, results))
+        addr = (servers[0].host, servers[0].port)
+        p = ctx.Process(target=target, args=(cfg, addr, n, 1000 + w, cpu, barrier, results))
         p.start()
         procs.append(p)
     barrier.wait()
     time.sleep(cfg["warmup"])
-    # Summed over all servers: a cluster's CPU can exceed 100%.
-    pids = [s.proc.pid for s in servers]
-    user0, sys0 = map(sum, zip(*(cpu_seconds(pid) for pid in pids)))
-    sleeps0 = sum(sleeps(pid) for pid in pids)
+    # Summed over all servers: a cluster's CPU can exceed 100%. A --target
+    # server's CPU isn't visible from here, so it isn't reported.
+    local = all(s.proc is not None for s in servers)
+    pids = [s.proc.pid for s in servers] if local else []
+    if local:
+        user0, sys0 = map(sum, zip(*(cpu_seconds(pid) for pid in pids)))
+        sleeps0 = sum(sleeps(pid) for pid in pids)
     time.sleep(cfg["duration"])
-    user1, sys1 = map(sum, zip(*(cpu_seconds(pid) for pid in pids)))
-    sleeps1 = sum(sleeps(pid) for pid in pids)
+    if local:
+        user1, sys1 = map(sum, zip(*(cpu_seconds(pid) for pid in pids)))
+        sleeps1 = sum(sleeps(pid) for pid in pids)
     parts = [results.get(timeout=60) for _ in procs]
     for p in procs:
         p.join()
@@ -435,15 +465,15 @@ def run(cfg, servers, client_cpus):
         "ops_per_sec": round(sum(p["ops"] for p in parts) / cfg["duration"]),
         "latency_us": {"mean": us(hist.mean()), "p50": us(hist.percentile(50)), "p90": us(hist.percentile(90)),
                        "p99": us(hist.percentile(99)), "p99.9": us(hist.percentile(99.9)), "max": us(hist.max)},
-        "server_cpu_pct": round(100 * (user1 - user0 + sys1 - sys0) / cfg["duration"], 1),
-        "server_user_pct": round(100 * (user1 - user0) / cfg["duration"], 1),
-        "server_sys_pct": round(100 * (sys1 - sys0) / cfg["duration"], 1),
+        "server_cpu_pct": round(100 * (user1 - user0 + sys1 - sys0) / cfg["duration"], 1) if local else None,
+        "server_user_pct": round(100 * (user1 - user0) / cfg["duration"], 1) if local else None,
+        "server_sys_pct": round(100 * (sys1 - sys0) / cfg["duration"], 1) if local else None,
         "server_sleeps_per_op": None,
         "client_cpu_pct_max": round(100 * max(p["cpu"] for p in parts) / cfg["duration"], 1),
         "errors": sum(p["errors"] for p in parts),
     }
     ops = result["ops_per_sec"] * cfg["duration"]
-    result["server_sleeps_per_op"] = round((sleeps1 - sleeps0) / ops, 3) if ops else None
+    result["server_sleeps_per_op"] = round((sleeps1 - sleeps0) / ops, 3) if ops and local else None
     # Each client sleep ends with a wakeup, which the server's write() pays for.
     result["client_sleeps_per_op"] = round(sum(p["sleeps"] for p in parts) / ops, 3) if ops else None
     if cfg["rate"]:
@@ -460,10 +490,13 @@ def describe(r):
     if cfg.get("client", "raw") != "raw" or cfg.get("nodes", 1) > 1:
         shape = "%s %d node%s  %s" % (cfg.get("client", "raw"), cfg.get("nodes", 1),
                                       "s" if cfg.get("nodes", 1) > 1 else " ", shape)
-    line = ("%s %9s ops/s   p50 %7.1fus  p99 %7.1fus  p99.9 %8.1fus   "
-            "server CPU %5.1f%% (user %4.1f%% sys %4.1f%%)  sleeps/op %5.3f  client CPU %5.1f%% sleeps/op %5.3f") % (
-        shape, "{:,}".format(r["ops_per_sec"]), lat["p50"], lat["p99"], lat["p99.9"],
-        r["server_cpu_pct"], r["server_user_pct"], r["server_sys_pct"], r["server_sleeps_per_op"] or 0,
+    if r["server_cpu_pct"] is None:
+        server = "server CPU n/a (remote)"
+    else:
+        server = "server CPU %5.1f%% (user %4.1f%% sys %4.1f%%)  sleeps/op %5.3f" % (
+            r["server_cpu_pct"], r["server_user_pct"], r["server_sys_pct"], r["server_sleeps_per_op"] or 0)
+    line = "%s %9s ops/s   p50 %7.1fus  p99 %7.1fus  p99.9 %8.1fus   %s  client CPU %5.1f%% sleeps/op %5.3f" % (
+        shape, "{:,}".format(r["ops_per_sec"]), lat["p50"], lat["p99"], lat["p99.9"], server,
         r["client_cpu_pct_max"], r["client_sleeps_per_op"] or 0)
     warnings = []
     if r["client_cpu_pct_max"] > 90:
@@ -501,8 +534,12 @@ def config(args, clients, rate=0, pipeline=1):
 def cmd_run(args):
     if args.rate and args.client != "raw":
         sys.exit("--rate (open loop) is only supported with --client raw")
-    server_cpus, client_cpus = cpu_layout(args.nodes)
-    servers = start_servers(args.server, server_cpus)
+    if args.target:
+        _, client_cpus = cpu_layout(0)
+        servers = [Remote(args.target)]
+    else:
+        server_cpus, client_cpus = cpu_layout(args.nodes)
+        servers = start_servers(args.server, server_cpus)
     try:
         preload(servers, args.keys, args.value_size)
         r = run(config(args, args.clients, args.rate, args.pipeline), servers, client_cpus)
@@ -584,6 +621,8 @@ def main():
             s.add_argument("--client", choices=["raw", "kvclient"], default="raw",
                            help="raw: pre-encoded bytes; kvclient: the real Python client")
             s.add_argument("--nodes", type=int, default=1, help="masters in a cluster (1: standalone)")
+            s.add_argument("--target", metavar="HOST:PORT",
+                           help="benchmark a running server (or any node of a cluster) instead of starting one")
         else:
             s.add_argument("--client-counts", type=int, nargs="+", default=[1, 4, 16, 64])
         if name == "baseline":

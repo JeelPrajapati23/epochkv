@@ -97,6 +97,7 @@ cmake --build build -j
 ./build/src/kv_server                  # listens on 127.0.0.1:6380
 ./build/src/kv_server --bind 0.0.0.0 --port 7000
 ./build/src/kv_server --maxmemory 100mb --maxmemory-policy allkeys-lru
+./build/src/kv_server --maxclients 20000   # default 10000; raises the open-file limit to fit
 ./build/src/kv_server --dir /var/lib/kv --appendonly yes --appendfsync everysec
 ```
 
@@ -157,7 +158,7 @@ When a master dies, one of its replicas takes over its slots automatically, as i
 - **Agreement (`FAIL`):** once a majority of the masters serving slots report the same node within twice the node timeout, it's flagged `fail`. A `FAIL` message makes every reachable node agree at once.
 - **Election:** each replica of the failed master waits 0.5–1s, plus 1s for every sibling replica with a higher replication offset, so the most up-to-date replica usually goes first. It then increments the cluster's current epoch and asks every master for a vote. A master votes at most once per epoch and writes the vote to `nodes.conf` before sending it. A majority of votes wins.
 - **Promotion:** the winner takes the failed master's slots under the new epoch. That epoch is higher than any other, so its claim wins on every node. The other replicas follow it, continuing their replication stream with a partial resync. When the old master comes back, it learns it was replaced and becomes a replica.
-- **Safety limits:** a replica whose last contact with its master is older than `node_timeout × --cluster-replica-validity-factor` (default 10) plus the replication ping period won't try, because its data is too stale. `--cluster-replica-no-failover yes` disables automatic failover for a replica. A master that can't reach a majority of masters stops serving (`-CLUSTERDOWN`), so a partition's minority side can't keep accepting writes that the majority's failover would throw away.
+- **Safety limits:** a replica whose last contact with its master is older than `node_timeout × --cluster-replica-validity-factor` (default 10) plus the replication ping period won't try, because its data is too stale. `--cluster-replica-no-failover yes` disables automatic failover for a replica. A master that can't reach a majority of masters stops serving (`-CLUSTERDOWN`), so a partition's minority side can't keep accepting writes that the majority's failover would throw away. The same applies after a freeze: a master whose event loop didn't run for more than half the node timeout (a `SIGSTOP`, a stalled VM) refuses commands on waking until gossip has refreshed its view, instead of serving the writes that queued up meanwhile as if it were still master (see below).
 - **Manual failover:** `CLUSTER FAILOVER` on a replica pauses writes on its master, waits until the replica has applied the master's final offset, then runs the election. No acknowledged write is lost, and clients' paused writes are redirected to the new master. `FORCE` skips the master (for when it's unreachable). `TAKEOVER` also skips the vote (for when a majority of masters is gone).
 
 Replication stays asynchronous, so an automatic failover can still lose writes that the dead master acknowledged but never sent to its replica.
@@ -174,7 +175,46 @@ python3 bench/bench.py run --clients 16 --rate 40000              # open loop: h
 python3 bench/bench.py run --client kvclient --clients 12 --pipeline 16 --nodes 3   # real client, 3-master cluster
 python3 bench/bench.py crosscheck                                 # same load via redis-benchmark (needs redis-tools)
 python3 bench/bench.py crosscheck --pipeline 64                   # ... with 64-deep pipelines (redis-benchmark -P)
+python3 bench/connections.py --server kv                          # latency and memory with 0..10k idle connections
 ```
+
+### Idle connections
+
+`bench/connections.py` holds 0 to 10,000 idle connections open while 16 active clients run a fixed 20k ops/s:
+
+| idle connections | 0 | 1,000 | 5,000 | 10,000 |
+|---|---|---|---|---|
+| EpochKV p50 / p99 | 172 / 352µs | 172 / 360µs | 168 / 360µs | 164 / 426µs |
+| EpochKV server CPU | 52% | 51% | 53% | 53% |
+
+Latency and CPU stay flat: epoll's cost depends on active connections, not open ones (Redis 8 measured the same). Each connection costs ~250 B of server memory (Redis: ~2.5–5 KB) and ~4 KB per socket in the kernel, which dominates.
+
+## Network emulation and fault injection
+
+`bench/docker/` runs six nodes and a client as separate containers, each with its own IP, a CPU and 512 MB cap per node, and `tc netem` shaping each container's outgoing traffic (delay, jitter, loss).
+
+```bash
+docker compose -f bench/docker/compose.yml up -d --build
+python3 bench/netem.py latency                    # throughput vs round-trip time
+python3 bench/netem.py failover --mode kill       # kill -9 a master, under 4 network profiles
+python3 bench/netem.py failover --mode pause      # freeze a master past its failover, then thaw it
+docker compose -f bench/docker/compose.yml down
+```
+
+**Latency caps throughput** (ops/s, one server container, closed loop):
+
+| added RTT | 0 | 0.5 ms | 1 ms | 2 ms | 5 ms |
+|---|---|---|---|---|---|
+| 1 client | 13,067 | 1,438 | 776 | 414 | 183 |
+| 16 clients | 43,831 | 22,534 | 12,999 | 6,780 | 2,892 |
+| 16 clients, pipelined ×16 | 448,426 | 316,525 | 203,504 | 107,296 | 45,395 |
+
+Throughput is requests in flight divided by the round trip (Little's Law): one client gets ~1/RTT, and pipelining multiplies what's in flight.
+
+**Failover under realistic networks** (2s node timeout, a writer running throughout; profiles: none, 2 ms RTT, plus 1% loss, 5 ms RTT with jitter and 5% loss):
+- `kill -9` of a master: the replica took over in 3.1–3.4 s under every profile, and no acknowledged write was lost.
+- No healthy node was ever falsely suspected, even at 5% packet loss: TCP retransmits within ~200 ms, far inside the timeout. Only silence longer than the timeout (a partition) looks like a failure.
+- **Freezing a master (`docker pause`) found a bug.** On waking, the old master served the client writes that had queued in its sockets while it was frozen, as if still master, acknowledged them, learned a millisecond later that it had been replaced, and lost them when it resynced. That lost one acknowledged write in every run. The fix: the event loop notices it didn't run for more than half the node timeout and refuses commands (`-CLUSTERDOWN`) until gossip has refreshed its view. After the fix: no acknowledged write lost, and the first reply after waking is `CLUSTERDOWN` under every profile.
 
 ## Tests
 

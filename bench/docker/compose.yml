@@ -1,0 +1,43 @@
+# Six kv_server nodes (3 masters + 3 replicas once bench/netem.py creates the
+# cluster) and a client container for the load generator, each in its own
+# network namespace with its own IP, like separate machines. bench/netem.py
+# shapes each container's outgoing traffic with tc netem (delay, jitter,
+# loss), which needs NET_ADMIN inside the container.
+#
+#   docker compose -f bench/docker/compose.yml up -d --build
+#   python3 bench/netem.py latency      # or: failover, pause
+#   docker compose -f bench/docker/compose.yml down
+
+name: epochkv-netem
+
+x-node: &node
+  image: epochkv-netem
+  cap_add: [NET_ADMIN]
+  # A CPU's worth of time and a memory cap per node, as if each were its own
+  # small machine. Quota rather than pinning: Docker Desktop's VM doesn't
+  # expose which logical CPUs share a physical core.
+  cpus: 1.0
+  mem_limit: 512m
+  tmpfs: [/data]
+  # The 2s node timeout matches the integration tests and the failover demo,
+  # so failovers finish in seconds; production uses 15s.
+  command: >-
+    kv_server --bind 0.0.0.0 --port 6379 --cluster-enabled yes --cluster-port 16379
+    --cluster-node-timeout 2000 --dir /data --save ""
+
+services:
+  node1:
+    <<: *node
+    build:
+      context: ../..
+      dockerfile: bench/docker/Dockerfile
+  node2: *node
+  node3: *node
+  node4: *node
+  node5: *node
+  node6: *node
+  client:
+    image: epochkv-netem
+    cap_add: [NET_ADMIN]
+    command: sleep infinity
+    depends_on: [node1]

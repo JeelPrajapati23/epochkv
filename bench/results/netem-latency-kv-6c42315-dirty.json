@@ -1,0 +1,106 @@
+{
+  "meta": {
+    "server": "kv",
+    "commit": "6c42315-dirty",
+    "date": "2026-10-01 19:51:31",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "setup": "docker: server and client containers, netem on both"
+  },
+  "runs": [
+    {
+      "rtt_ms": 0,
+      "1 client": {
+        "ops_per_sec": 13067,
+        "p50_us": 65.5,
+        "p99_us": 176.1
+      },
+      "16 clients": {
+        "ops_per_sec": 43831,
+        "p50_us": 311.3,
+        "p99_us": 753.7
+      },
+      "16 clients x16": {
+        "ops_per_sec": 448426,
+        "p50_us": 466.9,
+        "p99_us": 1114.1
+      }
+    },
+    {
+      "rtt_ms": 0.5,
+      "1 client": {
+        "ops_per_sec": 1438,
+        "p50_us": 688.1,
+        "p99_us": 1015.8
+      },
+      "16 clients": {
+        "ops_per_sec": 22534,
+        "p50_us": 688.1,
+        "p99_us": 999.4
+      },
+      "16 clients x16": {
+        "ops_per_sec": 316525,
+        "p50_us": 786.4,
+        "p99_us": 1179.6
+      }
+    },
+    {
+      "rtt_ms": 1,
+      "1 client": {
+        "ops_per_sec": 776,
+        "p50_us": 1278.0,
+        "p99_us": 1671.2
+      },
+      "16 clients": {
+        "ops_per_sec": 12999,
+        "p50_us": 1212.4,
+        "p99_us": 1540.1
+      },
+      "16 clients x16": {
+        "ops_per_sec": 203504,
+        "p50_us": 1245.2,
+        "p99_us": 1638.4
+      }
+    },
+    {
+      "rtt_ms": 2,
+      "1 client": {
+        "ops_per_sec": 414,
+        "p50_us": 2424.8,
+        "p99_us": 2883.6
+      },
+      "16 clients": {
+        "ops_per_sec": 6780,
+        "p50_us": 2359.3,
+        "p99_us": 3014.7
+      },
+      "16 clients x16": {
+        "ops_per_sec": 107296,
+        "p50_us": 2359.3,
+        "p99_us": 2949.1
+      }
+    },
+    {
+      "rtt_ms": 5,
+      "1 client": {
+        "ops_per_sec": 183,
+        "p50_us": 5505.0,
+        "p99_us": 6291.5
+      },
+      "16 clients": {
+        "ops_per_sec": 2892,
+        "p50_us": 5636.1,
+        "p99_us": 6160.4
+      },
+      "16 clients x16": {
+        "ops_per_sec": 45395,
+        "p50_us": 5636.1,
+        "p99_us": 6422.5
+      }
+    }
+  ]
+}
