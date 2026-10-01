@@ -95,11 +95,18 @@ def sleeps(pid):
 
 
 def git_commit():
+    """HEAD's short hash, plus "-dirty" if tracked files differ from it (as
+    `git describe --dirty` does), so results from uncommitted code aren't
+    credited to the commit before it. Line-ending-only differences don't
+    count: viewed from WSL, a Windows checkout's CRLF files all look changed."""
     try:
-        return subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
-                              capture_output=True, text=True, check=True).stdout.strip()
+        commit = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        diff = subprocess.run(["git", "-C", ROOT, "diff", "--quiet", "--ignore-cr-at-eol", "HEAD"],
+                              capture_output=True)
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
+    return commit + "-dirty" if diff.returncode == 1 else commit
 
 
 def machine_info():
