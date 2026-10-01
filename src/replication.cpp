@@ -98,6 +98,9 @@ void Replication::replicaof(const std::string& host, uint16_t port) {
         return;
     }
     close_link();
+    // A replica keeps a backlog of its master's stream, for its own
+    // replicas and for siblings to continue from if it's promoted.
+    stream_started_ = true;
     master_host_ = host;
     master_port_ = port;
     link_state_ = LinkState::kConnect;
@@ -148,7 +151,7 @@ void Replication::shift_replid() {
 // --- master side --------------------------------------------------------------
 
 void Replication::propagate(const Args& argv) {
-    if (is_replica()) {
+    if (!wants_commands()) {
         return;
     }
     std::string cmd;
@@ -201,6 +204,9 @@ void Replication::psync(Client& c, const std::string& replid, int64_t offset, st
         return;
     }
     c.repl_ack_time = now();
+    // Before the snapshot forks: every write after it must reach the stream.
+    // Writes before it are in the snapshot, so starting late loses nothing.
+    stream_started_ = true;
     if (try_partial_resync(c, replid, offset, out)) {
         ++sync_partial_ok_;
         return;

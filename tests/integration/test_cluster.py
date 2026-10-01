@@ -166,9 +166,12 @@ class ClusterTest(unittest.TestCase):
         wait_until(ok, timeout, "the surviving nodes serving every slot")
 
     def wait_replicated(self, master, replica, timeout=10):
+        # The link must be up: before a master's first replica connects,
+        # both offsets are 0.
         def caught_up():
-            return (replica.info("replication").get("slave_repl_offset") ==
-                    master.info("replication")["master_repl_offset"])
+            info = replica.info("replication")
+            return (info.get("master_link_status") == "up" and
+                    info.get("slave_repl_offset") == master.info("replication")["master_repl_offset"])
         wait_until(caught_up, timeout, "replica catching up with its master")
 
     def add_replica(self, master, cluster_nodes):

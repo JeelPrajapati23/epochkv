@@ -401,6 +401,33 @@ TEST_CASE("INCR-family commands are propagated as SET <result> KEEPTTL; failures
                             });
 }
 
+TEST_CASE("writes don't build their logged command while nothing reads it, but still count", "[dispatcher][propagation]") {
+    TempDir dir;
+    ClockedStore cs;
+    Persistence::Options options;
+    options.dir = dir.path;
+    options.save_points.clear();
+    Persistence persistence(cs.store, options);
+    CommandDispatcher d(cs.store);
+    d.set_persistence(&persistence);
+    PropagationLog log;
+    log.attach(d);
+    bool wanted = false;
+    d.set_log_wanted([&wanted] { return wanted; });
+
+    run(d, {"SET", "a", "1", "EX", "10"});
+    run(d, {"INCR", "n"});
+    run(d, {"EXPIRE", "n", "100"});
+    REQUIRE(log.commands.empty());
+    REQUIRE(persistence.changes_since_save() == 3);  // still drives the save points
+    REQUIRE(*cs.store.get("a") == "1");               // the writes themselves happened
+    REQUIRE(run(d, {"TTL", "n"}) == ":100\r\n");
+
+    wanted = true;
+    run(d, {"SET", "b", "2"});
+    REQUIRE(log.commands == std::vector<std::string>{"SET b 2"});
+}
+
 TEST_CASE("EXPIREAT and SET EXAT use absolute times", "[dispatcher][ttl]") {
     ClockedStore cs;  // now = 1,000,000 ms = 1000 s
     CommandDispatcher d(cs.store);
@@ -453,6 +480,29 @@ TEST_CASE("a replica refuses writes from clients but applies its master's", "[di
     out.clear();
     d.dispatch({"SET", "k", "v2"}, out, &user);
     REQUIRE(out == "+OK\r\n");
+}
+
+TEST_CASE("the replication stream starts once replication does, and never stops", "[dispatcher][replication]") {
+    TempDir dir;
+    Store store;
+    Persistence::Options options;
+    options.dir = dir.path;
+    options.save_points.clear();
+    Persistence persistence(store, options);
+    Replication replication(store, persistence, Replication::Options{});
+
+    REQUIRE_FALSE(replication.wants_commands());
+    replication.propagate({"SET", "k", "v"});
+    REQUIRE(replication.offset() == 0);  // no replica has ever connected: nothing recorded
+
+    replication.replicaof("127.0.0.1", 6390);
+    REQUIRE_FALSE(replication.wants_commands());  // a replica forwards its master's stream instead
+    replication.replicaof_no_one();
+    // Promoted, with no replica connected: it keeps recording, or a replica
+    // reconnecting later would be told to continue past writes it never got.
+    REQUIRE(replication.wants_commands());
+    replication.propagate({"SET", "k", "v"});
+    REQUIRE(replication.offset() > 0);
 }
 
 TEST_CASE("INFO reports the replication role", "[dispatcher][replication]") {

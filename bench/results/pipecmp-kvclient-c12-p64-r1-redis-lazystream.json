@@ -1,0 +1,49 @@
+{
+  "meta": {
+    "server": "redis",
+    "commit": "dcb92ba",
+    "date": "2026-10-01 19:02:25",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "keys": 100000,
+    "value_size": 64,
+    "read_ratio": 0.8
+  },
+  "runs": [
+    {
+      "config": {
+        "clients": 12,
+        "workers": 12,
+        "duration": 10,
+        "warmup": 2,
+        "keys": 100000,
+        "value_size": 64,
+        "read_ratio": 0.8,
+        "pipeline": 64,
+        "rate": 0,
+        "client": "kvclient",
+        "nodes": 1
+      },
+      "ops_per_sec": 774054,
+      "latency_us": {
+        "mean": 985.3,
+        "p50": 950.3,
+        "p90": 1310.7,
+        "p99": 1736.7,
+        "p99.9": 2359.3,
+        "max": 5852.2
+      },
+      "server_cpu_pct": 99.9,
+      "server_user_pct": 73.0,
+      "server_sys_pct": 26.9,
+      "server_sleeps_per_op": 0.0,
+      "client_cpu_pct_max": 37.9,
+      "errors": 0,
+      "client_sleeps_per_op": 0.016
+    }
+  ]
+}

@@ -205,6 +205,28 @@ class ReplicationTest(unittest.TestCase):
         self.assertIn("port=%d" % replica.port, info["slave0"])
         self.assertEqual(info["sync_full"], "1")
 
+    def test_stream_starts_with_the_first_replica(self):
+        master = self.node()
+        m = master.client()
+        for i in range(100):
+            m.cmd("SET", "k%d" % i, "v%d" % i)
+        m.cmd("INCR", "n")
+        # Nothing reads a stream yet, so none is recorded.
+        self.assertEqual(master.info()["master_repl_offset"], "0")
+
+        replica = self.replica_of(master)
+        self.wait_in_sync(master, replica)
+        r = replica.client()
+        self.assertEqual(r.cmd("DBSIZE"), 101)  # the earlier writes came in the snapshot
+        self.assertEqual(r.cmd("GET", "n"), b"1")
+
+        m.cmd("INCR", "n")
+        m.cmd("SET", "after", "1")
+        self.wait_in_sync(master, replica)
+        self.assertGreater(int(master.info()["master_repl_offset"]), 0)
+        self.assertEqual(r.cmd("GET", "n"), b"2")
+        self.assertEqual(r.cmd("GET", "after"), b"1")
+
     def test_large_dataset_with_writes_during_the_transfer(self):
         master = self.node()
         m = master.client()
@@ -309,9 +331,13 @@ class ReplicationTest(unittest.TestCase):
         for i in range(20):
             m.cmd("SET", "k%d" % i, str(i))
         # Both at the same offset at the same moment (a master PING between
-        # two separate checks could leave r1 one command behind r2).
-        self.wait_until(lambda: r1.info()["slave_repl_offset"] == r2.info()["slave_repl_offset"]
-                        == master.info()["master_repl_offset"], msg="both replicas in sync")
+        # two separate checks could leave r1 one command behind r2), with
+        # both links up: before any replica connects, all offsets are 0.
+        def both_in_sync():
+            i1, i2 = r1.info(), r2.info()
+            return (i1["master_link_status"] == i2["master_link_status"] == "up"
+                    and i1["slave_repl_offset"] == i2["slave_repl_offset"] == master.info()["master_repl_offset"])
+        self.wait_until(both_in_sync, msg="both replicas in sync")
 
         master.kill()
         c1 = r1.client()

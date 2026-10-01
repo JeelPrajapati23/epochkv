@@ -310,6 +310,10 @@ int main(int argc, char** argv) {
         }
     };
     dispatcher.set_propagator(propagate);
+    // With no AOF and no replication stream, nothing reads those commands:
+    // building them copies every SET's key and value for nothing.
+    dispatcher.set_log_wanted(
+        [&persistence, &replication] { return persistence.aof_enabled() || replication.wants_commands(); });
     // Keys the store drops on its own are logged as DEL, so replaying the
     // AOF can't resurrect them (e.g. an evicted key that had no TTL), and so
     // replicas — which never expire or evict keys themselves — drop them too.

@@ -17,13 +17,13 @@ A 3-master, 3-replica cluster takes writes through the Python client while one m
 | 1 node, ops/s (median of 3) | EpochKV | Redis 8.0.5 |
 |---|---|---|
 | 16 clients, no pipelining | 51.1k | 49.4k |
-| 12 clients × 64-deep pipelines (Python client) | **1.00M** | 1.00M |
-| `redis-benchmark`, 16 clients × 64, GET | 1.20M | 1.31M |
-| `redis-benchmark`, 16 clients × 64, SET | 762k | **1.12M** |
+| 12 clients × 64-deep pipelines (Python client) | **941k** | 864k |
+| `redis-benchmark`, 16 clients × 64, GET | 1.08M | 1.12M |
+| `redis-benchmark`, 16 clients × 64, SET | **941k** | 990k |
 
-A 3-node cluster reached **1.23M** ops/s with 12 clients × 64-deep pipelines (Python client, p99 983µs). That number is limited by the load generator, so it's a lower bound.
+Each row compares both servers in the same session, with their runs interleaved; compare within a row, not across rows. The pipelined rows ran in a session where the machine was slower overall, and Redis's harness runs varied from 774k to 888k, so that row is parity, not a win. A 3-node cluster reached **1.23M** ops/s with 12 clients × 64-deep pipelines (Python client, p99 983µs). That number is limited by the load generator, so it's a lower bound.
 
-Pipelining is about 20× faster on one node because it removes a wakeup per request, which measurement showed to be the main cost. Under our harness (80/20 GET/SET), EpochKV matches Redis with and without pipelining. Under `redis-benchmark` at depth 64, GET is within ~9%, but **Redis is ~1.5× faster on SET**: with the kernel's per-message cost spread over the batch, our own write path becomes the bottleneck. Likely causes, not yet profiled: every SET is encoded into the replication backlog even with no replicas, the value is copied one extra time, and each new key allocates a second copy of the key for the LRU list.
+Pipelining is about 18× faster on one node because it removes a wakeup per request, which measurement showed to be the main cost. With deep pipelines our own code becomes most of the CPU time, which exposed a gap: Redis was **1.47× faster on SET**. An experiment that disabled propagation recovered 40% of SET throughput, so propagation was the cause: every SET was copied, RESP-encoded and appended to the replication backlog even with no replicas and no AOF. Now, as in Redis, the replication stream starts only when a replica first connects, and writes skip building their logged command while nothing reads it. The SET gap is down to ~5%.
 
 ## Architecture
 

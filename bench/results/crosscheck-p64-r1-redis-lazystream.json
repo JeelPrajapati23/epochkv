@@ -1,0 +1,47 @@
+{
+  "meta": {
+    "server": "redis",
+    "commit": "dcb92ba",
+    "date": "2026-10-01 19:02:12",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "keys": 100000,
+    "value_size": 64,
+    "read_ratio": 0.8
+  },
+  "tool": "redis-benchmark",
+  "runs": [
+    {
+      "clients": 16,
+      "pipeline": 64,
+      "test": "SET",
+      "ops_per_sec": 1031353,
+      "latency_ms": {
+        "avg": 0.934,
+        "min": 0.12,
+        "p50": 0.919,
+        "p95": 1.127,
+        "p99": 1.415,
+        "max": 5.407
+      }
+    },
+    {
+      "clients": 16,
+      "pipeline": 64,
+      "test": "GET",
+      "ops_per_sec": 1119821,
+      "latency_ms": {
+        "avg": 0.853,
+        "min": 0.104,
+        "p50": 0.839,
+        "p95": 1.063,
+        "p99": 1.319,
+        "max": 4.119
+      }
+    }
+  ]
+}

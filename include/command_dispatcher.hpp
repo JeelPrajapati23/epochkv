@@ -26,6 +26,12 @@ public:
     explicit CommandDispatcher(Store& store);
 
     void set_propagator(Propagator propagator) { propagator_ = std::move(propagator); }
+    // Whether anything reads the propagated commands right now (an AOF or
+    // the replication stream). Unset means always. While it says no, write
+    // handlers don't build the command they'd propagate, which would copy
+    // the key and value for nothing; the write is still counted toward the
+    // save points.
+    void set_log_wanted(std::function<bool()> wanted) { log_wanted_ = std::move(wanted); }
     // Enables SAVE/BGSAVE/BGREWRITEAOF/LASTSAVE, and refusing writes while
     // they can't be persisted. Optional: without it those commands error.
     void set_persistence(Persistence* persistence) { persistence_ = persistence; }
@@ -78,6 +84,17 @@ private:
     static bool arity_ok(int arity, size_t argc);
     bool loading() const;
     void propagate(const Args& argv);
+    // For a write whose propagated command has to be built first:
+    // `build()` runs only if something will read the result.
+    template <typename Build>
+    void propagate_built(Build build) {
+        if (propagator_ && (!log_wanted_ || log_wanted_())) {
+            propagate(build());
+        } else {
+            count_unlogged_write();
+        }
+    }
+    void count_unlogged_write();
 
     void cmd_ping(const Args& argv, std::string& out);
     void cmd_echo(const Args& argv, std::string& out);
@@ -122,6 +139,7 @@ private:
 
     Store& store_;
     Propagator propagator_;
+    std::function<bool()> log_wanted_;
     Persistence* persistence_ = nullptr;
     Replication* replication_ = nullptr;
     Cluster* cluster_ = nullptr;

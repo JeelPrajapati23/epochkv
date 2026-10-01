@@ -78,6 +78,12 @@ void Persistence::propagate(const Args& argv) {
     }
 }
 
+void Persistence::count_change() {
+    if (!loading_) {
+        ++dirty_;
+    }
+}
+
 void Persistence::before_sleep() {
     if (!aof_) {
         return;

@@ -59,6 +59,13 @@ public:
     const std::string& master_host() const { return master_host_; }
     uint16_t master_port() const { return master_port_; }
     uint64_t offset() const { return backlog_.offset(); }
+    // Whether propagate() records commands. Not until a replica first
+    // connects to us or we become a replica, so a node that never
+    // replicates skips encoding every write and copying it into the
+    // backlog, and its offset stays 0 (Redis creates its backlog for the
+    // first replica, too). False on a replica, which forwards its master's
+    // stream instead.
+    bool wants_commands() const { return stream_started_ && !is_replica(); }
     const std::string& replid() const { return replid_; }
     std::chrono::seconds ping_period() const { return options_.ping_period; }
 
@@ -148,6 +155,11 @@ private:
     std::string replid2_;
     std::optional<uint64_t> second_replid_offset_;
     ReplBacklog backlog_;
+    // See wants_commands(). Never reset: stopping while no replica is
+    // connected would leave the offset still while writes happen, so a
+    // replica reconnecting from a dropped link would be told +CONTINUE with
+    // nothing to send, and silently miss every one of those writes.
+    bool stream_started_ = false;
     // False while no one else has seen replid_ (fresh start, or just
     // promoted): a PSYNC naming it could never succeed, so we send
     // "PSYNC ? -1" and ask for a full resync outright.

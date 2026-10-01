@@ -61,6 +61,12 @@ public:
 
     // Records one change to the dataset, as a command that reproduces it.
     void propagate(const Args& argv);
+    // Records one change without its command, for writes whose command
+    // nobody would read (no AOF, no replication stream). It still counts
+    // toward the save points.
+    void count_change();
+    bool aof_enabled() const { return aof_ != nullptr; }
+    uint64_t changes_since_save() const { return dirty_; }
 
     // Once per event-loop iteration, before replies are sent.
     void before_sleep();

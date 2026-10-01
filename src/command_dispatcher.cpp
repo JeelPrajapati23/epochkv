@@ -128,6 +128,13 @@ void CommandDispatcher::propagate(const Args& argv) {
     }
 }
 
+// What the propagator would have done for the write, minus the command.
+void CommandDispatcher::count_unlogged_write() {
+    if (propagator_ && persistence_ != nullptr) {
+        persistence_->count_change();
+    }
+}
+
 bool CommandDispatcher::arity_ok(int arity, size_t argc) {
     if (arity >= 0) {
         return argc == static_cast<size_t>(arity);
@@ -286,15 +293,15 @@ void CommandDispatcher::cmd_set(const Args& argv, std::string& out) {
     }
     // "EX 10" means something different when replayed a day later, so the
     // log gets the absolute deadline instead.
-    if (propagator_) {
+    propagate_built([&] {
         Args logged{"SET", argv[1], argv[2]};
         if (expire_at) {
             logged.insert(logged.end(), {"PXAT", std::to_string(*expire_at)});
         } else if (keep_ttl) {
             logged.push_back("KEEPTTL");
         }
-        propagate(logged);
-    }
+        return logged;
+    });
     reply::simple_string(out, "OK");
 }
 
@@ -351,7 +358,7 @@ void CommandDispatcher::incr_by(const std::string& key, int64_t delta, std::stri
     }
     std::string text = std::to_string(value);
     store_.set(key, text, /*keep_ttl=*/true);
-    propagate({"SET", key, std::move(text), "KEEPTTL"});
+    propagate_built([&] { return Args{"SET", key, std::move(text), "KEEPTTL"}; });
     reply::integer(out, value);
 }
 
@@ -407,7 +414,9 @@ void CommandDispatcher::expire_generic(const Args& argv, int64_t unit_ms, bool r
         reply::integer(out, 0);
         return;
     }
-    propagate(*when <= now ? Args{"DEL", argv[1]} : Args{"PEXPIREAT", argv[1], std::to_string(*when)});
+    propagate_built([&] {
+        return *when <= now ? Args{"DEL", argv[1]} : Args{"PEXPIREAT", argv[1], std::to_string(*when)};
+    });
     reply::integer(out, 1);
 }
 
@@ -704,13 +713,13 @@ void CommandDispatcher::cmd_restore(const Args& argv, std::string& out) {
     if (expire_at) {
         store_.set_expire(key, *expire_at);
     }
-    if (propagator_) {
+    propagate_built([&] {
         Args logged{"SET", key, std::move(value)};
         if (expire_at) {
             logged.insert(logged.end(), {"PXAT", std::to_string(*expire_at)});
         }
-        propagate(logged);
-    }
+        return logged;
+    });
     reply::simple_string(out, "OK");
 }
 
