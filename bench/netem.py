@@ -195,15 +195,18 @@ def analyse(result, mode, victim_addr, t_event, t_thaw):
         # back), and `unpause` returns some time after the process runs
         # again. The stale writer's first timeout is certain to fall inside
         # the freeze, so every reply after it came after the wake.
-        frozen = next((r[0] for r in stale["replies"] if r[0] >= t_event and r[1] == "timeout"), None)
-        after = [r for r in stale["replies"] if frozen is not None and r[0] > frozen]
-        ok_after = [r for r in after if r[1] == "ok"]
+        # Runs: [kind, first t, last t, count, first write, last write].
+        runs = stale["runs"]
+        frozen = next((r[1] for r in runs if r[2] >= t_event and r[0] == "timeout"), None)
+        after = [r for r in runs if frozen is not None and r[1] > frozen]
+        ok_after = [r for r in after if r[0] == "ok"]
         out["thawed_at_s"] = since(t_thaw)
         out["victim_demoted_s"] = since(first(events, t_thaw, event="role", value="replica", subject_id=victim))
-        out["stale_writes_accepted_after_thaw"] = len(ok_after)
-        out["stale_first_reply_after_thaw"] = next((r[1] for r in after if r[1] != "timeout"), None)
-        out["stale_accepted_write_survived"] = (stale["final_value"] is not None and
-                                                any(str(r[2]) == stale["final_value"] for r in ok_after))
+        out["stale_writes_accepted_after_thaw"] = sum(r[3] for r in ok_after)
+        out["stale_first_reply_after_thaw"] = next((r[0] for r in after if r[0] != "timeout"), None)
+        final = stale["final_value"]
+        out["stale_accepted_write_survived"] = (final is not None and
+                                                any(r[4] <= int(final) <= r[5] for r in ok_after))
     return out
 
 

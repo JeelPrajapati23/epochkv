@@ -73,14 +73,24 @@ def parse_addr(s):
 
 
 class StaleWriter(threading.Thread):
-    """Writes straight to one node, on a key it owns, ignoring redirects:
-    records the time and kind of every reply."""
+    """Writes straight to one node, on a key it owns, ignoring redirects.
+    Records runs of the same reply kind rather than every reply (there are
+    hundreds of thousands): [kind, first time, last time, count, first
+    write number, last write number]."""
 
     def __init__(self, addr, key):
         super().__init__(daemon=True)
         self.addr, self.key = addr, key
-        self.replies = []  # (time, "ok" | error prefix | "timeout")
+        self.runs = []  # kind: "ok" | error prefix (MOVED, CLUSTERDOWN) | "timeout"
         self.stop = threading.Event()
+
+    def record(self, kind, i):
+        t = time.time()
+        if self.runs and self.runs[-1][0] == kind:
+            run = self.runs[-1]
+            run[2], run[3], run[5] = t, run[3] + 1, i
+        else:
+            self.runs.append([kind, t, t, 1, i, i])
 
     def run(self):
         conn, i = None, 0
@@ -89,12 +99,12 @@ class StaleWriter(threading.Thread):
                 if conn is None:
                     conn = Conn(*self.addr, timeout=0.5)
                 conn.call("SET", self.key, str(i))
-                self.replies.append((time.time(), "ok", i))
+                self.record("ok", i)
             except ReplyError as e:
-                self.replies.append((time.time(), str(e).split()[0], i))
+                self.record(str(e).split()[0], i)
                 time.sleep(0.01)
             except OSError:
-                self.replies.append((time.time(), "timeout", i))
+                self.record("timeout", i)
                 if conn is not None:
                     conn.close()
                 conn = None
@@ -211,7 +221,7 @@ def watch(args):
                          "uncertain_at": sorted(writer.uncertain_at.items(), key=lambda kv: kv[1])}}
     if stale:
         final = client.call("GET", stale.key)
-        result["stale"] = {"key": stale.key, "replies": stale.replies,
+        result["stale"] = {"key": stale.key, "runs": stale.runs,
                            "final_value": final.decode() if final is not None else None}
     print(json.dumps(result))
 
