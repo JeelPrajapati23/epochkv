@@ -1,0 +1,292 @@
+{
+  "meta": {
+    "server": "kv",
+    "commit": "58ef28a",
+    "baseline": "3e6b16e",
+    "date": "2026-10-02 19:26:35",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "cxxflags": [
+      "-O3",
+      "-DNDEBUG",
+      "-std=c++17"
+    ],
+    "lookups": 20000000,
+    "rounds": 5,
+    "cpu": 2
+  },
+  "rows": [
+    {
+      "keys": 1000,
+      "baseline": {
+        "find_ns_median": 30.46,
+        "insert_ns_median": 110.31,
+        "runs": [
+          {
+            "find_ns": 29.77,
+            "insert_ns": 115.83,
+            "checksum": 9990082803
+          },
+          {
+            "find_ns": 30.46,
+            "insert_ns": 110.31,
+            "checksum": 9990082803
+          },
+          {
+            "find_ns": 30.25,
+            "insert_ns": 111.24,
+            "checksum": 9990082803
+          },
+          {
+            "find_ns": 31.51,
+            "insert_ns": 109.63,
+            "checksum": 9990082803
+          },
+          {
+            "find_ns": 30.98,
+            "insert_ns": 108.35,
+            "checksum": 9990082803
+          }
+        ]
+      },
+      "current": {
+        "find_ns_median": 27.55,
+        "insert_ns_median": 105.36,
+        "runs": [
+          {
+            "find_ns": 27.44,
+            "insert_ns": 112.03,
+            "checksum": 9990082803
+          },
+          {
+            "find_ns": 27.48,
+            "insert_ns": 106.69,
+            "checksum": 9990082803
+          },
+          {
+            "find_ns": 27.76,
+            "insert_ns": 105.36,
+            "checksum": 9990082803
+          },
+          {
+            "find_ns": 28.04,
+            "insert_ns": 103.54,
+            "checksum": 9990082803
+          },
+          {
+            "find_ns": 27.55,
+            "insert_ns": 101.54,
+            "checksum": 9990082803
+          }
+        ]
+      },
+      "find_change_pct": -9.553512803676954,
+      "insert_change_pct": -4.487353821049771
+    },
+    {
+      "keys": 100000,
+      "baseline": {
+        "find_ns_median": 55.07,
+        "insert_ns_median": 137.67,
+        "runs": [
+          {
+            "find_ns": 64.18,
+            "insert_ns": 150.48,
+            "checksum": 999927436803
+          },
+          {
+            "find_ns": 56.06,
+            "insert_ns": 137.67,
+            "checksum": 999927436803
+          },
+          {
+            "find_ns": 53.52,
+            "insert_ns": 134.74,
+            "checksum": 999927436803
+          },
+          {
+            "find_ns": 53.18,
+            "insert_ns": 137.97,
+            "checksum": 999927436803
+          },
+          {
+            "find_ns": 55.07,
+            "insert_ns": 136.72,
+            "checksum": 999927436803
+          }
+        ]
+      },
+      "current": {
+        "find_ns_median": 50.47,
+        "insert_ns_median": 132.94,
+        "runs": [
+          {
+            "find_ns": 57.04,
+            "insert_ns": 139.6,
+            "checksum": 999927436803
+          },
+          {
+            "find_ns": 58.5,
+            "insert_ns": 149.52,
+            "checksum": 999927436803
+          },
+          {
+            "find_ns": 49.38,
+            "insert_ns": 121.47,
+            "checksum": 999927436803
+          },
+          {
+            "find_ns": 50.37,
+            "insert_ns": 128.04,
+            "checksum": 999927436803
+          },
+          {
+            "find_ns": 50.47,
+            "insert_ns": 132.94,
+            "checksum": 999927436803
+          }
+        ]
+      },
+      "find_change_pct": -8.353005266025061,
+      "insert_change_pct": -3.4357521609646184
+    },
+    {
+      "keys": 1000000,
+      "baseline": {
+        "find_ns_median": 125.59,
+        "insert_ns_median": 190.52,
+        "runs": [
+          {
+            "find_ns": 124.35,
+            "insert_ns": 205.69,
+            "checksum": 9998822236803
+          },
+          {
+            "find_ns": 125.59,
+            "insert_ns": 190.52,
+            "checksum": 9998822236803
+          },
+          {
+            "find_ns": 125.07,
+            "insert_ns": 181.28,
+            "checksum": 9998822236803
+          },
+          {
+            "find_ns": 126.72,
+            "insert_ns": 198.85,
+            "checksum": 9998822236803
+          },
+          {
+            "find_ns": 126.43,
+            "insert_ns": 187.59,
+            "checksum": 9998822236803
+          }
+        ]
+      },
+      "current": {
+        "find_ns_median": 112.32,
+        "insert_ns_median": 186.61,
+        "runs": [
+          {
+            "find_ns": 114.62,
+            "insert_ns": 200.04,
+            "checksum": 9998822236803
+          },
+          {
+            "find_ns": 112.32,
+            "insert_ns": 226.76,
+            "checksum": 9998822236803
+          },
+          {
+            "find_ns": 112.11,
+            "insert_ns": 186.61,
+            "checksum": 9998822236803
+          },
+          {
+            "find_ns": 119.26,
+            "insert_ns": 184.58,
+            "checksum": 9998822236803
+          },
+          {
+            "find_ns": 112.11,
+            "insert_ns": 180.33,
+            "checksum": 9998822236803
+          }
+        ]
+      },
+      "find_change_pct": -10.56612787642329,
+      "insert_change_pct": -2.052277976065503
+    },
+    {
+      "keys": 5000000,
+      "baseline": {
+        "find_ns_median": 168.22,
+        "insert_ns_median": 248.81,
+        "runs": [
+          {
+            "find_ns": 162.84,
+            "insert_ns": 287.37,
+            "checksum": 49991652236803
+          },
+          {
+            "find_ns": 173.39,
+            "insert_ns": 248.81,
+            "checksum": 49991652236803
+          },
+          {
+            "find_ns": 173.6,
+            "insert_ns": 245.61,
+            "checksum": 49991652236803
+          },
+          {
+            "find_ns": 163.06,
+            "insert_ns": 234.12,
+            "checksum": 49991652236803
+          },
+          {
+            "find_ns": 168.22,
+            "insert_ns": 271.71,
+            "checksum": 49991652236803
+          }
+        ]
+      },
+      "current": {
+        "find_ns_median": 158.6,
+        "insert_ns_median": 235.87,
+        "runs": [
+          {
+            "find_ns": 158.6,
+            "insert_ns": 235.87,
+            "checksum": 49991652236803
+          },
+          {
+            "find_ns": 160.83,
+            "insert_ns": 259.74,
+            "checksum": 49991652236803
+          },
+          {
+            "find_ns": 161.04,
+            "insert_ns": 225.01,
+            "checksum": 49991652236803
+          },
+          {
+            "find_ns": 149.69,
+            "insert_ns": 243.62,
+            "checksum": 49991652236803
+          },
+          {
+            "find_ns": 158.57,
+            "insert_ns": 229.94,
+            "checksum": 49991652236803
+          }
+        ]
+      },
+      "find_change_pct": -5.718701700154562,
+      "insert_change_pct": -5.200755596640006
+    }
+  ]
+}
