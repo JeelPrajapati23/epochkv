@@ -7,12 +7,16 @@
       key + value bytes. Also prints our store's own per-key estimate (the
       number maxmemory is enforced against), to show how far it is from
       real memory.
-  memory.py scale [--server kv|redis] [--keys N] [--no-replica]
+  memory.py scale [--server kv|redis] [--keys N] [--no-replica] [--overwrite-order rand|seq]
       Loads N keys while a probe connection PINGs every millisecond, then
       runs BGSAVE (under overwrite load, to show copy-on-write), a restart
       from the snapshot, and a full resync to a fresh replica. The probe's
       worst latencies show every moment the server stopped answering:
       hash table resizes, fork(), and so on.
+      The BGSAVE overwrites go in a scattered order by default. In insertion
+      order (seq) they walk memory in allocation order, so one copied page
+      covers many overwrites and copy-on-write looks ~10x cheaper than under
+      a realistic access pattern; results before this option existed used seq.
 
 Server data goes under ~/.cache/kvbench, not /tmp: on WSL /tmp is a tmpfs,
 so snapshot files there would eat the RAM being measured.
@@ -143,10 +147,24 @@ def encode_set(key, value, ttl):
     return b"".join(out)
 
 
-def load(server, keys, key_len, value_size, ttl=False, wrap=None, progress=None):
+# Odd and prime, so j -> j * SCATTER mod N is a bijection on 0..N-1 for any N
+# it doesn't divide: every key is still hit once per lap, in a scattered order.
+SCATTER = 2654435761
+
+
+def load(server, keys, key_len, value_size, ttl=False, wrap=None, progress=None, scatter=False):
     """Pipelined SETs in batches of BATCH over one connection. Returns the
     elapsed seconds; progress(t, keys_done) is called after each batch, and
-    returning True stops early. wrap=N overwrites keys 0..N-1 cyclically."""
+    returning True stops early. wrap=N overwrites keys 0..N-1 cyclically,
+    in a scattered order if scatter is set."""
+    if scatter:
+        assert wrap and wrap % SCATTER != 0
+
+    def index(i):
+        if not wrap:
+            return i
+        return (i % wrap) * SCATTER % wrap if scatter else i % wrap
+
     value = b"x" * value_size
     sock = socket.create_connection(("127.0.0.1", server.port))
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -154,7 +172,7 @@ def load(server, keys, key_len, value_size, ttl=False, wrap=None, progress=None)
     t0 = time.monotonic()
     for lo in range(0, keys, BATCH):
         hi = min(lo + BATCH, keys)
-        sock.sendall(b"".join(encode_set(key_name(i % wrap if wrap else i, key_len), value, ttl)
+        sock.sendall(b"".join(encode_set(key_name(index(i), key_len), value, ttl)
                               for i in range(lo, hi)))
         want = len(ok) * (hi - lo)
         buf = bytearray()
@@ -296,9 +314,10 @@ def ms(s):
     return "%.1f ms" % (s * 1e3)
 
 
-def overwrite_until(server, stop_when, key_len, value_size, total_keys):
-    """Overwrites existing keys in order, wrapping around, until stop_when()
-    is true. Returns how many were written."""
+def overwrite_until(server, stop_when, key_len, value_size, total_keys, scatter=False):
+    """Overwrites existing keys, wrapping around, until stop_when() is true:
+    in insertion order, or a scattered order if scatter is set. Returns how
+    many were written."""
     written = [0]
 
     def progress(_t, n):
@@ -306,7 +325,7 @@ def overwrite_until(server, stop_when, key_len, value_size, total_keys):
         return stop_when()
 
     if not stop_when():
-        load(server, 1 << 62, key_len, value_size, wrap=total_keys, progress=progress)
+        load(server, 1 << 62, key_len, value_size, wrap=total_keys, progress=progress, scatter=scatter)
     return written[0]
 
 
@@ -314,7 +333,8 @@ def cmd_scale(args):
     server_cpus, client_cpus = cpu_layout(1)
     probe_cpus = {client_cpus[0]}
     key_len, value_size = 12, args.value_size
-    result = {"keys": args.keys, "key_len": key_len, "value_size": value_size}
+    result = {"keys": args.keys, "key_len": key_len, "value_size": value_size,
+              "overwrite_order": args.overwrite_order}
 
     s = Server(args.server, set(server_cpus))
     try:
@@ -351,13 +371,15 @@ def cmd_scale(args):
                     pass
             return not kids and time.monotonic() - t_bgsave > 0.05 and os.path.exists(snap)
 
-        written = overwrite_until(s, done, key_len, value_size, args.keys)
+        written = overwrite_until(s, done, key_len, value_size, args.keys,
+                                  scatter=args.overwrite_order == "rand")
         bgsave_s = time.monotonic() - t_bgsave
         result["bgsave"] = {"seconds": bgsave_s, "file_bytes": os.path.getsize(snap),
                             "overwrites_during": written, "peak_cow_bytes": peak_cow[0],
                             "peak_parent_plus_cow": peak_total[0]}
-        print("bgsave   %.1fs, file %s, %d overwrites during it -> child copied %s (COW), peak ~%s"
-              % (bgsave_s, mb(os.path.getsize(snap)), written, mb(peak_cow[0]), mb(peak_total[0])))
+        print("bgsave   %.1fs, file %s, %d %s overwrites during it -> child copied %s (COW), peak ~%s"
+              % (bgsave_s, mb(os.path.getsize(snap)), written, args.overwrite_order, mb(peak_cow[0]),
+                 mb(peak_total[0])))
         bgsave_end = time.monotonic()
 
         # 3. Full resync to an empty replica.
@@ -441,6 +463,8 @@ def main():
     s.add_argument("--value-size", type=int, default=64)
     s.add_argument("--no-replica", action="store_true", help="skip the full-resync step (halves peak RAM)")
     s.add_argument("--top", type=int, default=8, help="how many of the worst load stalls to list")
+    s.add_argument("--overwrite-order", choices=["rand", "seq"], default="rand",
+                   help="order of the overwrites during BGSAVE (seq = insertion order, best case for COW)")
     args = p.parse_args()
     {"perkey": cmd_perkey, "scale": cmd_scale}[args.cmd](args)
 
