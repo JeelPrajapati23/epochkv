@@ -1,0 +1,99 @@
+{
+  "meta": {
+    "server": "kv",
+    "commit": "eae313d",
+    "date": "2026-10-02 20:47:08",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    }
+  },
+  "result": {
+    "keys": 5000000,
+    "key_len": 12,
+    "value_size": 64,
+    "overwrite_order": "rand",
+    "load": {
+      "seconds": 13.508011857999996,
+      "ops_per_sec": 370150.6966799704,
+      "rss": 1455702016,
+      "bytes_per_key": 289.9214336
+    },
+    "bgsave": {
+      "seconds": 3.422522745000002,
+      "file_bytes": 395000012,
+      "overwrites_during": 115000,
+      "peak_cow_bytes": 499007488,
+      "peak_parent_plus_cow": 1950396416
+    },
+    "full_resync": {
+      "seconds": 7.224027061000001,
+      "replica_rss": 1443397632
+    },
+    "stalls": {
+      "load": {
+        "worst": 0.004162844010444644,
+        "episodes_over_10ms": 0,
+        "top": []
+      },
+      "bgsave": {
+        "worst": 0.02139661203772647,
+        "episodes_over_10ms": 99,
+        "top": [
+          {
+            "at_keys": 5000000,
+            "worst": 0.02139661203772647
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.02037282903393134
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.020364330034574607
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.020355517037259574
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.020353171038308915
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.020342528036039198
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.020328033036882687
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.02031632603370781
+          }
+        ]
+      },
+      "resync": {
+        "worst": 0.04208685404687884,
+        "episodes_over_10ms": 2,
+        "top": [
+          {
+            "at_keys": 5000000,
+            "worst": 0.04208685404687884
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.020352097041325123
+          }
+        ]
+      }
+    },
+    "restart": {
+      "seconds": 3.5565356629999982,
+      "rss": 1443024896
+    }
+  }
+}
