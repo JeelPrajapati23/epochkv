@@ -208,7 +208,7 @@ public:
             Node* node = head;
             while (node != nullptr) {
                 Node* next = node->next;
-                Node*& dest = to.buckets[hash_key(node->key) % to.size];
+                Node*& dest = to.buckets[bucket_index(hash_key(node->key), to.size)];
                 node->next = dest;
                 dest = node;
                 node = next;
@@ -248,9 +248,18 @@ private:
         size_t size = 0;
     };
 
+    // Bucket counts start here and only ever double or halve (never below
+    // this), so every bucket count is a power of two; bucket_index() relies
+    // on it.
     static constexpr size_t kInitialBucketCount = 16;
+    static_assert((kInitialBucketCount & (kInitialBucketCount - 1)) == 0, "must be a power of two");
     static constexpr double kMaxLoadFactor = 0.75;
     static constexpr double kMinLoadFactor = 0.1;
+
+    // hash % size, as a mask: for a power-of-two size the two pick the same
+    // bucket, but the compiler can't know size is one, so % costs a 64-bit
+    // division (tens of cycles) where & costs one.
+    static size_t bucket_index(size_t hash, size_t size) { return hash & (size - 1); }
 
     // calloc rather than new Node*[n]() or a vector: those write zeros into
     // every bucket up front, while calloc can skip that for fresh pages from
@@ -284,9 +293,9 @@ private:
 
     Node* const& bucket_for(const std::string& key) const {
         size_t hash = hash_key(key);
-        size_t i = hash % tables_[0].size;
+        size_t i = bucket_index(hash, tables_[0].size);
         if (rehashing() && i < rehash_idx_) {
-            return tables_[1].buckets[hash % tables_[1].size];
+            return tables_[1].buckets[bucket_index(hash, tables_[1].size)];
         }
         return tables_[0].buckets[i];
     }

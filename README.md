@@ -176,6 +176,7 @@ python3 bench/bench.py run --client kvclient --clients 12 --pipeline 16 --nodes 
 python3 bench/bench.py crosscheck                                 # same load via redis-benchmark (needs redis-tools)
 python3 bench/bench.py crosscheck --pipeline 64                   # ... with 64-deep pipelines (redis-benchmark -P)
 python3 bench/connections.py --server kv                          # latency and memory with 0..10k idle connections
+python3 bench/hashbench.py --baseline HEAD~1                       # hash table alone: this header vs. an older one
 ```
 
 ### Idle connections
