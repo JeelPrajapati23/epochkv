@@ -1,0 +1,71 @@
+{
+  "meta": {
+    "server": "both",
+    "commit": "1852cf3",
+    "date": "2026-10-02 18:49:05",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    },
+    "keys": 1000000
+  },
+  "rows": [
+    {
+      "shape": "12B key, 8B value",
+      "key_len": 12,
+      "value_size": 8,
+      "ttl": false,
+      "raw": 20,
+      "kv": 207.785984,
+      "redis": 99.098624,
+      "redis_used_memory": 89.174608,
+      "kv_estimate": 160
+    },
+    {
+      "shape": "12B key, 64B value",
+      "key_len": 12,
+      "value_size": 64,
+      "ttl": false,
+      "raw": 76,
+      "kv": 287.862784,
+      "redis": 159.531008,
+      "redis_used_memory": 153.174608,
+      "kv_estimate": 216
+    },
+    {
+      "shape": "12B key, 256B value",
+      "key_len": 12,
+      "value_size": 256,
+      "ttl": false,
+      "raw": 268,
+      "kv": 479.952896,
+      "redis": 401.506304,
+      "redis_used_memory": 393.174608,
+      "kv_estimate": 408
+    },
+    {
+      "shape": "32B key, 64B value",
+      "key_len": 32,
+      "value_size": 64,
+      "ttl": false,
+      "raw": 96,
+      "kv": 383.52896,
+      "redis": 191.594496,
+      "redis_used_memory": 185.174608,
+      "kv_estimate": 256
+    },
+    {
+      "shape": "12B key, 64B value, TTL",
+      "key_len": 12,
+      "value_size": 64,
+      "ttl": true,
+      "raw": 76,
+      "kv": 366.75584,
+      "redis": 196.800512,
+      "redis_used_memory": 193.56328,
+      "kv_estimate": 292
+    }
+  ]
+}
