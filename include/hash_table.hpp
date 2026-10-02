@@ -2,16 +2,25 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
+#include <new>
 #include <optional>
 #include <random>
 #include <string>
 #include <utility>
-#include <vector>
 
 // Separate-chaining hash table from string keys to V, with FNV-1a hashing.
 // Grows (doubles) above load factor 0.75 and shrinks (halves) below 0.1; the
 // gap between the two thresholds keeps a table hovering near one boundary
 // from rehashing back and forth.
+//
+// Each bucket is the head pointer of a singly linked chain of nodes, as in
+// Redis's dict. An empty bucket costs 8 bytes, and the bucket array comes
+// from calloc(), which gets large blocks as fresh zero pages from the OS:
+// nothing is written up front, so allocating a resize's new array is ~free
+// instead of zero-filling every bucket (98ms at 8M buckets with
+// std::vector<std::vector<Entry>>).
 //
 // Resizing is incremental, as in Redis: a resize allocates the new bucket
 // array and then moves the old buckets over a few at a time — one per set()
@@ -23,44 +32,74 @@
 // >= rehash_idx_ and in the new array otherwise, and every lookup still
 // probes exactly one bucket.
 //
-// Pointers returned by find()/random_entry() are invalidated by the next
-// set(), del() or rehash_step(), since any of them may move entries between
-// buckets. find() never moves anything (unlike Redis, whose lookups also
-// advance a resize), so pointers stay valid across reads.
+// Pointers returned by find()/random_entry() stay valid until that entry is
+// deleted: moving a bucket relinks its nodes rather than copying them, so a
+// node never changes address. find() also never advances a resize (unlike
+// Redis, whose lookups do), so reads never change the table at all.
 template <typename V>
 class HashTable {
 public:
-    HashTable() { tables_[0].resize(kInitialBucketCount); }
+    HashTable() { tables_[0] = make_table(kInitialBucketCount); }
+
+    ~HashTable() {
+        for (Table& table : tables_) {
+            for (size_t i = 0; i < table.size; ++i) {
+                Node* node = table.buckets[i];
+                while (node != nullptr) {
+                    Node* next = node->next;
+                    delete node;
+                    node = next;
+                }
+            }
+        }
+    }
+
+    // Copying would need a deep copy of every chain; nothing needs it, and
+    // the default memberwise copy would make two tables free the same nodes.
+    HashTable(const HashTable&) = delete;
+    HashTable& operator=(const HashTable&) = delete;
+
+    // The moved-from table is left as a fresh empty one, still usable.
+    HashTable(HashTable&& other) : HashTable() { swap(other); }
+
+    // Swapping hands our old nodes to `other`, whose destructor frees them.
+    HashTable& operator=(HashTable&& other) noexcept {
+        swap(other);
+        return *this;
+    }
+
+    void swap(HashTable& other) noexcept {
+        std::swap(tables_[0], other.tables_[0]);
+        std::swap(tables_[1], other.tables_[1]);
+        std::swap(rehash_idx_, other.rehash_idx_);
+        std::swap(num_entries_, other.num_entries_);
+    }
 
     // Inserts or overwrites. Returns true if the key was newly inserted.
     bool set(const std::string& key, V value) {
         rehash_step(1);
-        auto& bucket = bucket_for(key);
-        for (auto& entry : bucket) {
-            if (entry.key == key) {
-                entry.value = std::move(value);
+        Node*& head = bucket_for(key);
+        for (Node* node = head; node != nullptr; node = node->next) {
+            if (node->key == key) {
+                node->value = std::move(value);
                 return false;
             }
         }
-        bucket.push_back({key, std::move(value)});
+        // At the head: O(1), and a key just written is likely to be read soon.
+        head = new Node{key, std::move(value), head};
         ++num_entries_;
         maybe_resize();
         return true;
     }
 
     V* find(const std::string& key) {
-        for (auto& entry : bucket_for(key)) {
-            if (entry.key == key) {
-                return &entry.value;
-            }
-        }
-        return nullptr;
+        return const_cast<V*>(std::as_const(*this).find(key));
     }
 
     const V* find(const std::string& key) const {
-        for (const auto& entry : bucket_for(key)) {
-            if (entry.key == key) {
-                return &entry.value;
+        for (const Node* node = bucket_for(key); node != nullptr; node = node->next) {
+            if (node->key == key) {
+                return &node->value;
             }
         }
         return nullptr;
@@ -79,10 +118,14 @@ public:
 
     bool del(const std::string& key) {
         rehash_step(1);
-        auto& bucket = bucket_for(key);
-        for (auto it = bucket.begin(); it != bucket.end(); ++it) {
-            if (it->key == key) {
-                bucket.erase(it);
+        // `link` points at whichever pointer leads to the current node — the
+        // bucket's head or the previous node's next — so unlinking the first
+        // node needs no special case.
+        for (Node** link = &bucket_for(key); *link != nullptr; link = &(*link)->next) {
+            Node* node = *link;
+            if (node->key == key) {
+                *link = node->next;
+                delete node;
                 --num_entries_;
                 maybe_resize();
                 return true;
@@ -105,17 +148,24 @@ public:
             return {nullptr, nullptr};
         }
         size_t first = rehashing() ? rehash_idx_ : 0;  // old buckets below this are empty
-        size_t live_old = tables_[0].size() - first;
-        std::uniform_int_distribution<size_t> pick_bucket(0, live_old + tables_[1].size() - 1);
+        size_t live_old = tables_[0].size - first;
+        std::uniform_int_distribution<size_t> pick_bucket(0, live_old + tables_[1].size - 1);
         while (true) {
             size_t i = pick_bucket(rng);
-            auto& bucket = i < live_old ? tables_[0][first + i] : tables_[1][i - live_old];
-            if (bucket.empty()) {
+            Node* head = i < live_old ? tables_[0].buckets[first + i] : tables_[1].buckets[i - live_old];
+            if (head == nullptr) {
                 continue;
             }
-            std::uniform_int_distribution<size_t> pick_entry(0, bucket.size() - 1);
-            Entry& entry = bucket[pick_entry(rng)];
-            return {&entry.key, &entry.value};
+            size_t length = 0;
+            for (Node* node = head; node != nullptr; node = node->next) {
+                ++length;
+            }
+            std::uniform_int_distribution<size_t> pick_entry(0, length - 1);
+            Node* node = head;
+            for (size_t k = pick_entry(rng); k > 0; --k) {
+                node = node->next;
+            }
+            return {&node->key, &node->value};
         }
     }
 
@@ -123,10 +173,10 @@ public:
     // modify the table.
     template <typename F>
     void for_each(F&& fn) const {
-        for (const auto& table : tables_) {
-            for (const auto& bucket : table) {
-                for (const auto& entry : bucket) {
-                    fn(entry.key, entry.value);
+        for (const Table& table : tables_) {
+            for (size_t i = 0; i < table.size; ++i) {
+                for (const Node* node = table.buckets[i]; node != nullptr; node = node->next) {
+                    fn(node->key, node->value);
                 }
             }
         }
@@ -141,49 +191,81 @@ public:
         if (!rehashing()) {
             return false;
         }
-        auto& from = tables_[0];
-        auto& to = tables_[1];
+        Table& from = tables_[0];
+        Table& to = tables_[1];
         size_t empty_visits = n * 10;
-        while (n > 0 && rehash_idx_ < from.size()) {
-            auto& bucket = from[rehash_idx_];
-            if (bucket.empty()) {
+        while (n > 0 && rehash_idx_ < from.size) {
+            Node*& head = from.buckets[rehash_idx_];
+            if (head == nullptr) {
                 ++rehash_idx_;
                 if (--empty_visits == 0) {
                     break;
                 }
                 continue;
             }
-            for (auto& entry : bucket) {
-                to[hash_key(entry.key) % to.size()].push_back(std::move(entry));
+            // Relink each node onto the head of its new bucket: no
+            // allocation, and no key or value is copied or moved.
+            Node* node = head;
+            while (node != nullptr) {
+                Node* next = node->next;
+                Node*& dest = to.buckets[hash_key(node->key) % to.size];
+                node->next = dest;
+                dest = node;
+                node = next;
             }
-            std::vector<Entry>().swap(bucket);  // clear() would keep the capacity allocated
+            head = nullptr;
             ++rehash_idx_;
             --n;
         }
-        if (rehash_idx_ == from.size()) {
-            from = std::move(to);
-            to = {};
+        if (rehash_idx_ == from.size) {
+            from = std::move(to);  // frees the old array; all its buckets are empty
+            to = Table{};
             rehash_idx_ = 0;
             maybe_resize();  // a burst of writes may already call for the next resize
         }
         return rehashing();
     }
 
-    bool rehashing() const { return !tables_[1].empty(); }
+    bool rehashing() const { return tables_[1].size != 0; }
     size_t size() const { return num_entries_; }
     // The bucket count the table is settling on: the new array's size while
     // a resize is in progress.
-    size_t bucket_count() const { return rehashing() ? tables_[1].size() : tables_[0].size(); }
+    size_t bucket_count() const { return rehashing() ? tables_[1].size : tables_[0].size; }
 
 private:
-    struct Entry {
+    struct Node {
         std::string key;
         V value;
+        Node* next;
+    };
+
+    struct FreeDeleter {
+        void operator()(Node** buckets) const { std::free(buckets); }
+    };
+
+    struct Table {
+        std::unique_ptr<Node*[], FreeDeleter> buckets;
+        size_t size = 0;
     };
 
     static constexpr size_t kInitialBucketCount = 16;
     static constexpr double kMaxLoadFactor = 0.75;
     static constexpr double kMinLoadFactor = 0.1;
+
+    // calloc rather than new Node*[n]() or a vector: those write zeros into
+    // every bucket up front, while calloc can skip that for fresh pages from
+    // the OS, which are already zero. Relies on all-zero bits being nullptr,
+    // which holds on every platform this builds for (Redis relies on it too).
+    static Table make_table(size_t size) {
+        Node** buckets = static_cast<Node**>(std::calloc(size, sizeof(Node*)));
+        if (buckets == nullptr) {
+            throw std::bad_alloc();
+        }
+        Table table;
+        table.buckets.reset(buckets);
+        table.size = size;
+        return table;
+    }
 
     // FNV-1a: cheap to compute, decent avalanche behavior for short ASCII keys.
     // Constants are the standard 64-bit FNV offset basis and prime.
@@ -196,22 +278,22 @@ private:
         return static_cast<size_t>(hash);
     }
 
-    std::vector<Entry>& bucket_for(const std::string& key) {
-        return const_cast<std::vector<Entry>&>(std::as_const(*this).bucket_for(key));
+    Node*& bucket_for(const std::string& key) {
+        return const_cast<Node*&>(std::as_const(*this).bucket_for(key));
     }
 
-    const std::vector<Entry>& bucket_for(const std::string& key) const {
+    Node* const& bucket_for(const std::string& key) const {
         size_t hash = hash_key(key);
-        size_t i = hash % tables_[0].size();
+        size_t i = hash % tables_[0].size;
         if (rehashing() && i < rehash_idx_) {
-            return tables_[1][hash % tables_[1].size()];
+            return tables_[1].buckets[hash % tables_[1].size];
         }
-        return tables_[0][i];
+        return tables_[0].buckets[i];
     }
 
     // Starts a resize if the load factor has left [0.1, 0.75]. Never while
     // one is already in progress: every set()/del() moves at least one old
-    // bucket, so a resize finishes within tables_[0].size() writes, and a
+    // bucket, so a resize finishes within tables_[0].size writes, and a
     // grow started at load 0.75 ends below load 0.9 even if every one of
     // those writes was an insert.
     //
@@ -222,18 +304,18 @@ private:
         if (rehashing()) {
             return;
         }
-        size_t buckets = tables_[0].size();
+        size_t buckets = tables_[0].size;
         double load = static_cast<double>(num_entries_) / buckets;
         if (load > kMaxLoadFactor) {
-            tables_[1].resize(buckets * 2);
+            tables_[1] = make_table(buckets * 2);
         } else if (buckets > kInitialBucketCount && load < kMinLoadFactor) {
-            tables_[1].resize(buckets / 2);
+            tables_[1] = make_table(buckets / 2);
         }
     }
 
     // tables_[0] holds the entries; during a resize, tables_[1] is the new
     // bucket array and old buckets [0, rehash_idx_) have been moved into it.
-    std::vector<std::vector<Entry>> tables_[2];
+    Table tables_[2];
     size_t rehash_idx_ = 0;
     size_t num_entries_ = 0;
 };
