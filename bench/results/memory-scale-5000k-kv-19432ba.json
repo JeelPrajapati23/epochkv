@@ -1,0 +1,70 @@
+{
+  "meta": {
+    "server": "kv",
+    "commit": "19432ba",
+    "date": "2026-10-02 18:45:15",
+    "machine": {
+      "cpu": "13th Gen Intel(R) Core(TM) i7-13650HX",
+      "cpus": 20,
+      "kernel": "6.18.33.2-microsoft-standard-WSL2",
+      "python": "3.14.4"
+    }
+  },
+  "result": {
+    "keys": 5000000,
+    "key_len": 12,
+    "value_size": 64,
+    "load": {
+      "seconds": 14.058737312999995,
+      "ops_per_sec": 355650.7166099862,
+      "rss": 1454563328,
+      "bytes_per_key": 289.7002496
+    },
+    "bgsave": {
+      "seconds": 2.7308076379999946,
+      "file_bytes": 395000012,
+      "overwrites_during": 167000,
+      "peak_cow_bytes": 61157376,
+      "peak_parent_plus_cow": 1516085248
+    },
+    "full_resync": {
+      "seconds": 8.284584644000006,
+      "replica_rss": 1443180544
+    },
+    "stalls": {
+      "load": {
+        "worst": 0.008915395022384587,
+        "episodes_over_10ms": 0,
+        "top": []
+      },
+      "bgsave": {
+        "worst": 0.021972470034384628,
+        "episodes_over_10ms": 1,
+        "top": [
+          {
+            "at_keys": 5000000,
+            "worst": 0.021972470034384628
+          }
+        ]
+      },
+      "resync": {
+        "worst": 0.0235249170307128,
+        "episodes_over_10ms": 2,
+        "top": [
+          {
+            "at_keys": 5000000,
+            "worst": 0.0235249170307128
+          },
+          {
+            "at_keys": 5000000,
+            "worst": 0.013227500040997597
+          }
+        ]
+      }
+    },
+    "restart": {
+      "seconds": 4.880699422999996,
+      "rss": 1442377728
+    }
+  }
+}
